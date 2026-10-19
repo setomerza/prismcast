@@ -45,7 +45,11 @@ describe("snapshotStreamSettings", () => {
 
     for(const [ index, path ] of NEXT_STREAM_PATHS.entries()) {
 
-      setNestedValue(config as unknown as Record<string, unknown>, path, ((getNestedValue(DEFAULTS, path) as number) * 3) + index + 1);
+      // Numeric leaves move arithmetically; string leaves (the encoder choices) take a value tagged with their index.
+      const original = getNestedValue(DEFAULTS, path);
+      const changed = (typeof original === "number") ? (original * 3) + index + 1 : String(original) + "-" + String(index);
+
+      setNestedValue(config as unknown as Record<string, unknown>, path, changed);
     }
 
     const assigned = NEXT_STREAM_PATHS.map((path) => getNestedValue(config, path));

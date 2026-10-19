@@ -23,10 +23,12 @@ import { snapshotStreamSettings } from "./streamSettings.ts";
 export const STREAM_SETTINGS_KEYS = declareKeysOf<StreamSettings>()([
 
   "audioBitsPerSecond",
+  "ffmpegVideoEncoder",
   "frameRate",
   "monitorInterval",
   "segmentDuration",
-  "videoBitsPerSecond"
+  "videoBitsPerSecond",
+  "videoEncoder"
 ] as const);
 
 /**

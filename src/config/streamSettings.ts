@@ -21,6 +21,9 @@ export interface StreamSettings {
   // The audio bitrate, in bits per second, the stream's captures and its FFmpeg encoder run at.
   readonly audioBitsPerSecond: Config["streaming"]["audioBitsPerSecond"];
 
+  // The FFmpeg encoder the stream's video is encoded with when videoEncoder is "ffmpeg".
+  readonly ffmpegVideoEncoder: Config["streaming"]["ffmpegVideoEncoder"];
+
   // The frame rate the stream's capture bounds hold.
   readonly frameRate: Config["streaming"]["frameRate"];
 
@@ -32,6 +35,9 @@ export interface StreamSettings {
 
   // The video bitrate, in bits per second, the stream's captures encode at.
   readonly videoBitsPerSecond: Config["streaming"]["videoBitsPerSecond"];
+
+  // Who encodes the stream's video: the browser, or FFmpeg from raw frames.
+  readonly videoEncoder: Config["streaming"]["videoEncoder"];
 }
 
 /**
@@ -46,9 +52,11 @@ export function snapshotStreamSettings(config: Config): StreamSettings {
   return Object.freeze({
 
     audioBitsPerSecond: config.streaming.audioBitsPerSecond,
+    ffmpegVideoEncoder: config.streaming.ffmpegVideoEncoder,
     frameRate: config.streaming.frameRate,
     monitorInterval: config.playback.monitorInterval,
     segmentDuration: config.hls.segmentDuration,
-    videoBitsPerSecond: config.streaming.videoBitsPerSecond
+    videoBitsPerSecond: config.streaming.videoBitsPerSecond,
+    videoEncoder: config.streaming.videoEncoder
   });
 }

@@ -5,9 +5,9 @@
  * construct context literals inline to exercise the resolution algorithm against synthetic filesystem scenarios without spawning real probe processes.
  */
 import type { Readable, Writable } from "node:stream";
+import { createDefaultFFmpegContext, runFFmpegQuietly } from "./ffmpeg.context.ts";
 import type { ChildProcess } from "node:child_process";
 import { LOG } from "./logger.ts";
-import { createDefaultFFmpegContext } from "./ffmpeg.context.ts";
 import { join } from "node:path";
 import { memoizeAsync } from "./memo.ts";
 import { spawn } from "node:child_process";
@@ -300,13 +300,35 @@ function spawnFFmpegProcess({ args, ffmpegBin, label, onError, streamId }: {
 }): FFmpegProcess {
 
   const ffmpeg = spawn(ffmpegBin, args, { stdio: [ "pipe", "pipe", "pipe" ] });
+
+  return { ...superviseFFmpeg({ ffmpeg, label, onError, stderr: ffmpeg.stderr, streamId }), process: ffmpeg, stdin: ffmpeg.stdin, stdout: ffmpeg.stdout };
+}
+
+/**
+ * Attaches the shared lifecycle to a spawned FFmpeg: stderr logging with noise filtering, exit and error callbacks, and the graceful kill. Split out of
+ * spawnFFmpegProcess so a spawn with a different stdio shape (the encoder's extra audio pipe) gets exactly the same supervision.
+ * @param options.ffmpeg - The spawned child.
+ * @param options.label - Descriptive label for log messages and error strings.
+ * @param options.onError - Callback invoked when FFmpeg exits unexpectedly or encounters an error.
+ * @param options.stderr - The child's stderr.
+ * @param options.streamId - Optional stream identifier for log prefixing.
+ * @returns The teardown-requested read and the kill function.
+ */
+function superviseFFmpeg({ ffmpeg, label, onError, stderr, streamId }: {
+  ffmpeg: ChildProcess;
+  label: string;
+  onError: (error: Error) => void;
+  stderr: Readable;
+  streamId?: string;
+}): Pick<FFmpegProcess, "isShuttingDown" | "kill"> {
+
   const logPrefix = streamId ? "[" + streamId + "] " : "";
 
   // Track whether graceful shutdown has been initiated. When true, we suppress error callbacks because any exit (whether from SIGTERM or stdin close) is expected.
   let shuttingDown = false;
 
   // Log FFmpeg stderr output (warnings and errors). Suppress noise patterns that are not actionable.
-  ffmpeg.stderr.on("data", (data: Buffer) => {
+  stderr.on("data", (data: Buffer) => {
 
     if(shuttingDown) {
 
@@ -364,14 +386,7 @@ function spawnFFmpegProcess({ args, ffmpegBin, label, onError, streamId }: {
     }
   };
 
-  return {
-
-    isShuttingDown: (): boolean => shuttingDown,
-    kill,
-    process: ffmpeg,
-    stdin: ffmpeg.stdin,
-    stdout: ffmpeg.stdout
-  };
+  return { isShuttingDown: (): boolean => shuttingDown, kill };
 }
 
 // Public FFmpeg arg builders. Pure functions whose output is the exact argv array spawnFFmpeg / spawnMpegTsRemuxer pass to spawn(). Extracted so tests can
@@ -506,6 +521,216 @@ export function spawnMpegTsRemuxer(ffmpegBin: string, onError: (error: Error) =>
     onError,
     streamId
   });
+}
+
+// FFmpeg Video Encoding.
+
+/* The encoder mode. With streaming.videoEncoder set to "ffmpeg", the capture sends unencoded frames (browser/rawCapture.ts) that streaming/rawPump.ts paces into
+ * two pipes: yuv420p video on stdin and 48 kHz stereo f32le audio on fd 3. This FFmpeg encodes both and writes the same fragmented MP4 the remux path writes, so
+ * everything downstream of the capture session is unchanged.
+ */
+
+/**
+ * The FFmpeg video encoders the encoder mode knows how to drive.
+ */
+export type FFmpegVideoEncoder = "h264_nvenc" | "libx264";
+
+/**
+ * What an encoder FFmpeg is built for: the raw input's geometry and rate, the output bitrates, and the keyframe spacing the HLS segmenter needs.
+ */
+export interface EncoderFFmpegOptions {
+
+  readonly audioBitrate: number;
+  readonly comment?: string;
+  readonly encoder: FFmpegVideoEncoder;
+  readonly frameRate: number;
+  readonly height: number;
+
+  // Frames between keyframes. The segmenter cuts at keyframes, so this is the segment duration in frames.
+  readonly keyframeInterval: number;
+  readonly platform?: NodeJS.Platform;
+  readonly videoBitrate: number;
+  readonly width: number;
+}
+
+/**
+ * An encoder FFmpeg: the remux process's shape plus the audio pipe on fd 3.
+ */
+export interface EncoderFFmpegProcess extends FFmpegProcess {
+
+  readonly audioIn: Writable;
+}
+
+/**
+ * Whether a string names an encoder the encoder mode can drive.
+ * @param value - The configured encoder name.
+ * @returns True for a supported encoder.
+ */
+export function isFFmpegVideoEncoder(value: string): value is FFmpegVideoEncoder {
+
+  return (value === "h264_nvenc") || (value === "libx264");
+}
+
+/**
+ * Builds the video-encoder arguments for one encoder. Both are tuned for live: constant bitrate, no B-frames (so frames leave in display order and the
+ * segmenter's keyframe cuts land where expected), and a fixed keyframe interval with no scene-cut keyframes in between.
+ * @param encoder - The encoder.
+ * @param videoBitrate - Target bitrate in bits per second.
+ * @param keyframeInterval - Frames between keyframes.
+ * @returns The arguments, starting with -c:v.
+ */
+export function buildVideoEncoderArgs(encoder: FFmpegVideoEncoder, videoBitrate: number, keyframeInterval: number): string[] {
+
+  const rate = [ "-b:v", String(videoBitrate), "-maxrate", String(videoBitrate), "-bufsize", String(videoBitrate * 2) ];
+  const gop = [ "-g", String(keyframeInterval), "-bf", "0" ];
+
+  if(encoder === "h264_nvenc") {
+
+    return [ "-c:v", "h264_nvenc", "-preset", "p4", "-tune", "ll", "-rc", "cbr", ...rate, ...gop, "-forced-idr", "1", "-profile:v", "high" ];
+  }
+
+  return [ "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", ...rate, ...gop, "-keyint_min", String(keyframeInterval), "-sc_threshold", "0",
+    "-profile:v", "high" ];
+}
+
+/**
+ * Builds the argv for an encoder FFmpeg: raw video on stdin, raw audio on fd 3, fragmented MP4 on stdout with the same flags the remux path uses.
+ * @param options - The encoder's input geometry, rate, and output settings.
+ * @returns The FFmpeg argv array (excluding the binary itself).
+ */
+export function buildEncoderFFmpegArgs(options: EncoderFFmpegOptions): string[] {
+
+  const platform = options.platform ?? process.platform;
+  const aacEncoder = platform === "darwin" ? "aac_at" : "aac";
+
+  const ffmpegArgs = [
+    "-hide_banner",
+    "-nostats",
+    "-loglevel", "warning",
+    // Raw yuv420p frames at a constant rate: the pump guarantees exactly frameRate frames per second of capture.
+    "-f", "rawvideo",
+    "-pix_fmt", "yuv420p",
+    "-video_size", String(options.width) + "x" + String(options.height),
+    "-framerate", String(options.frameRate),
+    "-i", "pipe:0",
+    // Continuous 48 kHz stereo float audio, aligned by the pump to the first video frame.
+    "-f", "f32le",
+    "-ar", "48000",
+    "-ac", "2",
+    "-i", "pipe:3",
+    "-map", "0:v",
+    "-map", "1:a",
+    ...buildVideoEncoderArgs(options.encoder, options.videoBitrate, options.keyframeInterval),
+    "-c:a", aacEncoder,
+    "-b:a", String(options.audioBitrate),
+    "-f", "mp4",
+    "-movflags", "frag_keyframe+empty_moov+default_base_moof+skip_sidx+skip_trailer",
+    "-flush_packets", "1"
+  ];
+
+  if(options.comment) {
+
+    ffmpegArgs.push("-metadata", "comment=PrismCast - " + options.comment);
+  }
+
+  ffmpegArgs.push("pipe:1");
+
+  return ffmpegArgs;
+}
+
+/**
+ * Builds the argv for the encoder probe: one generated frame, encoded and discarded. A build that lists an encoder can still be unable to use it - NVENC needs
+ * the driver's libraries and a GPU the process can open - so the probe encodes rather than reading -encoders.
+ * @param encoder - The encoder to try.
+ * @returns The FFmpeg argv array (excluding the binary itself).
+ */
+export function buildEncoderProbeArgs(encoder: FFmpegVideoEncoder): string[] {
+
+  return [ "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=256x144:r=30", "-frames:v", "1",
+    ...buildVideoEncoderArgs(encoder, 1000000, 30), "-f", "null", "-" ];
+}
+
+/**
+ * Spawns an encoder FFmpeg with the extra audio pipe, under the same lifecycle supervision as every other FFmpeg.
+ * @param ffmpegBin - The FFmpeg binary, one resolveEncoderFFmpegPath found able to use the encoder.
+ * @param options - The encoder's input geometry, rate, and output settings.
+ * @param onError - Callback invoked when FFmpeg exits unexpectedly or encounters an error.
+ * @param streamId - Stream identifier for logging.
+ * @returns The process wrapper with stdin for video, audioIn for audio, and stdout for fMP4.
+ */
+export function spawnEncoderFFmpeg(ffmpegBin: string, options: EncoderFFmpegOptions, onError: (error: Error) => void,
+  streamId?: string): EncoderFFmpegProcess {
+
+  const ffmpeg = spawn(ffmpegBin, buildEncoderFFmpegArgs(options), { stdio: [ "pipe", "pipe", "pipe", "pipe" ] });
+  const [ stdin, stdout, stderr, audioIn ] = ffmpeg.stdio as unknown as [ Writable, Readable, Readable, Writable ];
+
+  return { ...superviseFFmpeg({ ffmpeg, label: "FFmpeg encoder", onError, stderr, streamId }), audioIn, process: ffmpeg, stdin, stdout };
+}
+
+/**
+ * Where the encoder FFmpeg search looks and how it tests a candidate. Production reads it from the environment and the remux resolver; tests pass literals.
+ */
+export interface EncoderFFmpegContext {
+
+  // The candidates, in order of preference. Duplicates and empty entries are skipped.
+  readonly candidates: readonly (string | undefined)[];
+
+  // Runs FFmpeg at a path with the given arguments and answers whether it exited cleanly.
+  readonly run: (path: string, args: string[]) => Promise<boolean>;
+}
+
+/**
+ * Finds the first candidate FFmpeg that can actually encode with an encoder.
+ * @param encoder - The encoder.
+ * @param ctx - The candidates and the runner.
+ * @returns The first working candidate, or undefined when none can encode.
+ */
+export async function probeEncoderFFmpegPath(encoder: FFmpegVideoEncoder, ctx: EncoderFFmpegContext): Promise<string | undefined> {
+
+  const tried = new Set<string>();
+
+  for(const candidate of ctx.candidates) {
+
+    if(!candidate || tried.has(candidate)) {
+
+      continue;
+    }
+
+    tried.add(candidate);
+
+    // eslint-disable-next-line no-await-in-loop -- Candidates are tried in order of preference, one at a time.
+    if(await ctx.run(candidate, buildEncoderProbeArgs(encoder))) {
+
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
+// One memoized search per encoder, so the probe encode runs once per process rather than once per stream.
+const encoderPathSearches = new Map<FFmpegVideoEncoder, Promise<string | undefined>>();
+
+/**
+ * Resolves the FFmpeg the encoder mode uses for an encoder, against the production host. The order differs from the remux resolver on purpose: the remux path
+ * prefers the Channels DVR and bundled builds, which copy video and need no encoder, while an encoder needs a build linked against it - typically the system's.
+ * So PRISMCAST_FFMPEG_PATH comes first, then the FFmpeg on PATH, then whatever the remux resolver found. Memoized per encoder.
+ * @param encoder - The encoder.
+ * @returns The FFmpeg to spawn, or undefined when no candidate can encode with it.
+ */
+export async function resolveEncoderFFmpegPath(encoder: FFmpegVideoEncoder): Promise<string | undefined> {
+
+  let search = encoderPathSearches.get(encoder);
+
+  if(!search) {
+
+    search = (async (): Promise<string | undefined> => probeEncoderFFmpegPath(encoder,
+      { candidates: [ process.env["PRISMCAST_FFMPEG_PATH"], "ffmpeg", await resolveFFmpegPath() ], run: runFFmpegQuietly }))();
+
+    encoderPathSearches.set(encoder, search);
+  }
+
+  return search;
 }
 
 /**

@@ -9,9 +9,11 @@ import { BrowserCaptureImpairedError, BrowserSupersededError, BrowserUnavailable
 import { CAPTURE_SOURCE_UNAVAILABLE_MESSAGE, isChannelSelectionProfile } from "../types/index.ts";
 import { CaptureAbandonedError, CaptureTurnTimeoutError, createCaptureLock } from "./captureLock.ts";
 import type { CaptureStream, CaptureStreamOptions } from "../browser/index.ts";
+import type { FFmpegProcess, FFmpegVideoEncoder } from "../utils/index.ts";
 import { FINALIZE_SETTLE_DELAY, installManifestInterceptor } from "../browser/manifestInterceptor.ts";
-import { LOG, chromeFetch, extractDomain, formatError, getStreamContext, maxRetryDuration, registerAbortController,
-  resolveFFmpegPath, retryOperation, runWithStreamContext, spawnFFmpeg, startTimer, timeoutSignal, toError, waitWithTimeout } from "../utils/index.ts";
+import { LOG, chromeFetch, extractDomain, formatError, getStreamContext, isFFmpegVideoEncoder, maxRetryDuration, registerAbortController,
+  resolveEncoderFFmpegPath, resolveFFmpegPath, retryOperation, runWithStreamContext, spawnEncoderFFmpeg, spawnFFmpeg, startTimer, timeoutSignal, toError,
+  waitWithTimeout } from "../utils/index.ts";
 import type { ManifestInterceptionResult, ManifestInterceptorHandle } from "../browser/manifestInterceptor.ts";
 import type { MonitorHandle, TabReplacementResult } from "./recovery.ts";
 import type { Nullable, ResolvedChannel, ResolvedSiteProfile, TuneResult, UrlValidationResult } from "../types/index.ts";
@@ -26,7 +28,9 @@ import type { InitializePlaybackOptions } from "../browser/video.ts";
 import type { MonitorStreamInfo } from "./monitor.ts";
 import type { ProbeCacheIdentity } from "../native/probe.ts";
 import type { StreamSettings } from "../config/streamSettings.ts";
+import type { Writable } from "node:stream";
 import { createCaptureSession } from "./captureSession.ts";
+import { createRawPump } from "./rawPump.ts";
 import { getBuiltinProfile } from "../config/sites.ts";
 import { getCachedEncryption } from "../native/probe.ts";
 import { getCaptureMimeType } from "./codec.ts";
@@ -569,11 +573,62 @@ export interface CreatePageWithCaptureDeps {
   readonly spawnFFmpeg: typeof spawnFFmpeg;
   readonly startOverlayHandling: typeof startOverlayHandling;
   readonly syncWindowVisibility: typeof syncWindowVisibility;
+
+  /* The encoder mode's two host-facing collaborators, optional so a deps literal written before the mode existed still type-checks and runs the default path:
+   * the search for an FFmpeg that can use the configured encoder (it runs a test encode per candidate), and the spawn of that FFmpeg with its audio pipe.
+   */
+  readonly resolveEncoderFFmpegPath?: typeof resolveEncoderFFmpegPath;
+  readonly spawnEncoderFFmpeg?: typeof spawnEncoderFFmpeg;
 }
 
 const defaultCreatePageWithCaptureDeps: CreatePageWithCaptureDeps = { acquireCaptureStream, awaitCaptureVerdict: noteClassifiedCaptureFailure,
-  emulateCaptureSurface, getCurrentBrowser, installActivationHeal, openSharedWindowTab, reaffirmCaptureSurface, resolveFFmpegPath, spawnFFmpeg,
-  startOverlayHandling, syncWindowVisibility };
+  emulateCaptureSurface, getCurrentBrowser, installActivationHeal, openSharedWindowTab, reaffirmCaptureSurface, resolveEncoderFFmpegPath, resolveFFmpegPath,
+  spawnEncoderFFmpeg, spawnFFmpeg, startOverlayHandling, syncWindowVisibility };
+
+/**
+ * The encoder a stream's capture feeds when FFmpeg encodes its video: the encoder and the FFmpeg found able to use it.
+ */
+export interface EncoderPlan {
+
+  readonly encoder: FFmpegVideoEncoder;
+  readonly ffmpegBin: string;
+}
+
+// The encoder fallbacks already reported, so a host without the configured encoder logs it once rather than on every tune.
+const reportedEncoderFallbacks = new Set<string>();
+
+/**
+ * Decides who encodes a stream's video. A stream configured for the browser gets no plan. A stream configured for FFmpeg gets one when the configured encoder is
+ * one this mode drives and some FFmpeg on the host can encode with it; otherwise it falls back to the browser encoder, with one warning per reason per process,
+ * because a stream that plays through the default path beats a stream that fails.
+ * @param settings - The stream's settings.
+ * @param resolveEncoderPath - The encoder FFmpeg search.
+ * @returns The plan, or null for the browser encoder.
+ */
+export async function resolveEncoderPlan(settings: StreamSettings,
+  resolveEncoderPath: typeof resolveEncoderFFmpegPath = resolveEncoderFFmpegPath): Promise<Nullable<EncoderPlan>> {
+
+  if(settings.videoEncoder !== "ffmpeg") {
+
+    return null;
+  }
+
+  const encoder = settings.ffmpegVideoEncoder;
+  const ffmpegBin = isFFmpegVideoEncoder(encoder) ? await resolveEncoderPath(encoder) : undefined;
+
+  if(isFFmpegVideoEncoder(encoder) && ffmpegBin) {
+
+    return { encoder, ffmpegBin };
+  }
+
+  if(!reportedEncoderFallbacks.has(encoder)) {
+
+    reportedEncoderFallbacks.add(encoder);
+    LOG.warn("No FFmpeg on this host can encode with %s, so streams use the browser encoder instead.", encoder);
+  }
+
+  return null;
+}
 
 /* The window-topology answers the open primitive needs and cannot reach for itself: tabSelection.ts speaks to the capture extension alone, so the CDP-side carrier
  * resolution and placement confirmation arrive from here, where both modules are already in view. One record, referenced by every call site, because every call
@@ -661,6 +716,11 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
   // the single owner from the instant the stream exists. Falls back to "ffmpeg" so spawn() defers to PATH lookup.
   const ffmpegBin = (await deps.resolveFFmpegPath()) ?? "ffmpeg";
 
+  // Who encodes the video is decided here too, for the same reason: the encoder search can await a test encode, which must not sit between acquiring the capture
+  // and owning it. With a plan, the capture runs the raw recorder and FFmpeg encodes; without one, everything below runs exactly as it always has.
+  const encoderPlan = await resolveEncoderPlan(settings, deps.resolveEncoderFFmpegPath);
+  const spawnEncoder = deps.spawnEncoderFFmpeg ?? spawnEncoderFFmpeg;
+
   // The capture-pipeline composite, assigned once the raw capture stream and its FFmpeg child exist and registered on the DisposableStack the moment it is built.
   let captureSession: CaptureSession;
 
@@ -673,6 +733,7 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
       audio: true,
       audioBitsPerSecond: settings.audioBitsPerSecond,
       mimeType: captureMimeType,
+      ...(encoderPlan ? { recorder: "raw" as const } : {}),
       video: true,
       videoBitsPerSecond: settings.videoBitsPerSecond,
 
@@ -744,7 +805,7 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
     // Spawn FFmpeg to remux the Matroska capture to fMP4: it copies the captured video and transcodes the Opus audio to AAC. The binary path was resolved up front
     // (above) so no throwable await sits between acquiring the raw capture stream and wrapping it in the CaptureSession that owns it. The spawn and pipeline wiring
     // below are synchronous, so the stream is owned the instant it exists.
-    const ffmpeg = deps.spawnFFmpeg(ffmpegBin, settings.audioBitsPerSecond, (error) => {
+    const onProcessError = (error: Error): void => {
 
       LOG.error("FFmpeg process error: %s.", formatError(error));
 
@@ -752,7 +813,58 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
 
         onFFmpegError(error);
       }
-    }, streamId, comment);
+    };
+
+    /* In the encoder mode FFmpeg encodes rather than remuxes: the pump between the capture and FFmpeg turns the raw recorder's messages into constant-rate
+     * yuv420p on stdin and aligned audio on the extra pipe, and the capture is piped into the pump instead of into FFmpeg. Keyframes land every segment
+     * duration, because the segmenter cuts there.
+     */
+    let ffmpeg: FFmpegProcess;
+    let captureSink: Writable;
+
+    if(encoderPlan) {
+
+      const encoderProcess = spawnEncoder(encoderPlan.ffmpegBin, {
+
+        audioBitrate: settings.audioBitsPerSecond,
+        comment,
+        encoder: encoderPlan.encoder,
+        frameRate: settings.frameRate,
+        height: surface.height,
+        keyframeInterval: Math.max(1, Math.round(settings.frameRate * settings.segmentDuration)),
+        videoBitrate: settings.videoBitsPerSecond,
+        width: surface.width
+      }, onProcessError, streamId);
+
+      // The pump writes FFmpeg's two input pipes directly rather than through pipeline(), so their errors are handled here: a closed pipe is teardown's or
+      // FFmpeg's own exit, which the exit handler reports; anything else is a fault in its own right.
+      for(const input of [ encoderProcess.stdin, encoderProcess.audioIn ]) {
+
+        input.on("error", (error) => {
+
+          const errorMessage = formatError(error);
+
+          if(errorMessage.includes("EPIPE") || errorMessage.includes("write after end") || encoderProcess.isShuttingDown()) {
+
+            LOG.debug("streaming:ffmpeg", "FFmpeg encoder input closed: %s.", errorMessage);
+
+            return;
+          }
+
+          LOG.error("FFmpeg encoder input error: %s.", errorMessage);
+          encoderProcess.kill();
+          onFFmpegError?.(error);
+        });
+      }
+
+      ffmpeg = encoderProcess;
+      captureSink = createRawPump({ audioOut: encoderProcess.audioIn, frameRate: settings.frameRate, height: surface.height, videoOut: encoderProcess.stdin,
+        width: surface.width });
+    } else {
+
+      ffmpeg = deps.spawnFFmpeg(ffmpegBin, settings.audioBitsPerSecond, onProcessError, streamId, comment);
+      captureSink = ffmpeg.stdin;
+    }
 
     /* A disposed pipeline must never fire its error callback. The listeners below sit on the process's own streams rather than inside the spawn wrapper, so
      * they are the places a post-kill teardown event can still reach a caller, and each gates on the same teardown flag the wrapper's own handlers use.
@@ -784,9 +896,9 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
       }
     });
 
-    // Pipe the Matroska capture stream to FFmpeg's stdin using pipeline() for proper cleanup. When FFmpeg is killed during tab replacement, pipeline() automatically
-    // destroys the source stream, preventing "write after end" errors that would occur with .pipe().
-    pipeline(stream, ffmpeg.stdin).catch((error: unknown) => {
+    // Pipe the capture stream to FFmpeg's stdin (or to the encoder mode's pump) using pipeline() for proper cleanup. When FFmpeg is killed during tab
+    // replacement, pipeline() automatically destroys the source stream, preventing "write after end" errors that would occur with .pipe().
+    pipeline(stream, captureSink).catch((error: unknown) => {
 
       const errorMessage = formatError(error);
 

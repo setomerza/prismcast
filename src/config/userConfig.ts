@@ -627,6 +627,27 @@ export const CONFIG_METADATA: Record<string, SettingMetadata[]> = {
     },
     {
 
+      description: "Who encodes the video. browser: Chrome encodes it, as it always has. ffmpeg: Chrome sends unencoded frames and FFmpeg encodes them with the " +
+        "FFmpeg Video Encoder below - for GPUs Chrome cannot encode with, such as NVIDIA on Linux. Falls back to browser when FFmpeg lacks that encoder.",
+      envVar: "VIDEO_ENCODER",
+      label: "Video Encoder",
+      path: "streaming.videoEncoder",
+      reactivity: "next-stream",
+      type: "string",
+      validValues: [ "browser", "ffmpeg" ]
+    },
+    {
+
+      description: "The encoder FFmpeg uses when Video Encoder is ffmpeg. h264_nvenc encodes on an NVIDIA GPU; libx264 encodes in software.",
+      envVar: "FFMPEG_VIDEO_ENCODER",
+      label: "FFmpeg Video Encoder",
+      path: "streaming.ffmpegVideoEncoder",
+      reactivity: "next-stream",
+      type: "string",
+      validValues: [ "h264_nvenc", "libx264" ]
+    },
+    {
+
       description: "Video quality preset. Determines capture resolution. Bitrate and frame rate can be further customized.",
       envVar: "QUALITY_PRESET",
       label: "Quality Preset",
@@ -810,12 +831,14 @@ export interface UserStreamingConfig {
   audioBitsPerSecond?: number;
   captureCodecs?: string[];
   captureMode?: string;
+  ffmpegVideoEncoder?: string;
   frameRate?: number;
   maxConcurrentStreams?: number;
   maxNavigationRetries?: number;
   navigationTimeout?: number;
   qualityPreset?: string;
   videoBitsPerSecond?: number;
+  videoEncoder?: string;
   videoTimeout?: number;
 }
 
@@ -1517,12 +1540,14 @@ export const DEFAULTS: Config = {
     audioBitsPerSecond: 256000,
     captureCodecs: [ CAPTURE_BASELINE_CODEC, "hevc" ],
     captureMode: "ffmpeg",
+    ffmpegVideoEncoder: "h264_nvenc",
     frameRate: 60,
     maxConcurrentStreams: 10,
     maxNavigationRetries: 4,
     navigationTimeout: 10000,
     qualityPreset: "720p-high",
     videoBitsPerSecond: 12000000,
+    videoEncoder: "browser",
     videoTimeout: 11000
   }
 };
@@ -1938,8 +1963,8 @@ const SETTINGS_TAB_SECTIONS: { displayName: string; id: string; paths: string[] 
 
     displayName: "Capture",
     id: "capture",
-    paths: [ "streaming.captureMode", "streaming.captureCodecs", "streaming.qualityPreset", "streaming.videoBitsPerSecond", "streaming.audioBitsPerSecond",
-      "streaming.frameRate" ]
+    paths: [ "streaming.captureMode", "streaming.captureCodecs", "streaming.videoEncoder", "streaming.ffmpegVideoEncoder", "streaming.qualityPreset",
+      "streaming.videoBitsPerSecond", "streaming.audioBitsPerSecond", "streaming.frameRate" ]
   },
   {
 

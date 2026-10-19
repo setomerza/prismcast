@@ -313,6 +313,9 @@ export interface StreamingConfig {
   // after 20-30 minutes of recording.
   captureMode: CaptureMode;
 
+  // The FFmpeg video encoder a stream uses when videoEncoder is "ffmpeg": "h264_nvenc" for NVIDIA GPUs, or "libx264" in software.
+  ffmpegVideoEncoder: string;
+
   // Target frame rate for video capture. Higher frame rates produce smoother video but require more CPU and bandwidth. 60fps is ideal for sports content; 30fps
   // is sufficient for most television content. The browser may deliver fewer frames if the source content has a lower frame rate.
   frameRate: number;
@@ -337,6 +340,11 @@ export interface StreamingConfig {
   // the video stream directly without re-encoding, preserving this quality. 8Mbps is suitable for 720p content; 15-20Mbps is recommended for 1080p. The actual
   // bitrate may vary based on content complexity.
   videoBitsPerSecond: number;
+
+  // Who encodes a stream's video. "browser" has Chrome's MediaRecorder encode it and FFmpeg only remux it. "ffmpeg" has the capture send unencoded frames for
+  // FFmpeg to encode with ffmpegVideoEncoder, for GPUs Chrome cannot encode with, such as NVIDIA on Linux. A stream whose FFmpeg lacks that encoder falls back to
+  // "browser".
+  videoEncoder: string;
 
   // Timeout in milliseconds for waiting for a video element to become ready. After navigating to a page, we wait for a video element with sufficient readyState.
   // Increase for sites with slow-loading video players or heavy preroll content.

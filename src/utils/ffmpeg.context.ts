@@ -29,6 +29,24 @@ async function checkFFmpegAtPath(pathToCheck: string): Promise<boolean> {
 }
 
 /**
+ * Runs FFmpeg at a path with the given arguments, discarding its output, and answers whether it exited cleanly. The encoder FFmpeg search tests each candidate
+ * with a one-frame encode through this.
+ * @param pathToCheck - Full path to the FFmpeg executable, or "ffmpeg" for a PATH lookup.
+ * @param args - The arguments.
+ * @returns Promise resolving to true on a clean exit.
+ */
+export async function runFFmpegQuietly(pathToCheck: string, args: string[]): Promise<boolean> {
+
+  const { promise, resolve } = Promise.withResolvers<boolean>();
+  const ffmpeg = spawn(pathToCheck, args, { stdio: [ "ignore", "ignore", "ignore" ] });
+
+  ffmpeg.on("error", () => { resolve(false); });
+  ffmpeg.on("exit", (code) => { resolve(code === 0); });
+
+  return promise;
+}
+
+/**
  * Builds the default FFmpegContext from real runtime I/O.
  * @returns An FFmpegContext populated from the live process.
  */
