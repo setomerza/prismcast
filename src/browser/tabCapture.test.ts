@@ -14,6 +14,7 @@ import { ACTIVE_TAB_GRANT_CEILING_MS, ACTIVE_TAB_GRANT_POLL_MS, CAPTURE_FRAME_SI
   EXTENSION_READY_EXPRESSION, acquireCaptureStream } from "./tabCapture.ts";
 import type { Browser, Page } from "puppeteer-core";
 import type { CaptureStreamOptions, ExtensionRecordingSettings, TabCaptureDeps } from "./tabCapture.ts";
+import { RAW_CAPTURE_MAX_BUFFERED_BYTES, RAW_HEADER_SIZE, RAW_KIND_AUDIO, RAW_KIND_VIDEO, RAW_PIXEL_FORMATS } from "./rawCapture.ts";
 import type { SelectedTab, WithTabSelectedContext } from "./tabSelection.ts";
 import { TestClock, advanceThroughSchedule, drainClock, settle } from "homebridge-plugin-utils/testing";
 import type { WebSocket, WebSocketServer } from "ws";
@@ -21,6 +22,7 @@ import { describe, test } from "node:test";
 import { CAPTURE_SOURCE_UNAVAILABLE_MESSAGE } from "../types/index.ts";
 import { EventEmitter } from "node:events";
 import type { LogEntry } from "../utils/logEmitter.ts";
+import type { RawRecordingSettings } from "./rawCapture.ts";
 import { TAB_NOT_SELECTED_MESSAGE } from "./tabSelection.ts";
 import assert from "node:assert/strict";
 import { closePuppeteerStreamWssOnIdle } from "../testing.helpers.ts";
@@ -48,11 +50,11 @@ const OPTIONS: CaptureStreamOptions = {
   }
 };
 
-// One evaluate the extension page served, tagged by which of the four protocol calls it was.
+// One evaluate the extension page served, tagged by which of the protocol calls it was.
 interface ExtensionCall {
 
   arg: unknown;
-  kind: "ready" | "start" | "stop" | "tabs";
+  kind: "rawStart" | "rawStop" | "ready" | "start" | "stop" | "tabs";
 }
 
 // The socket double: an emitter the test drives, plus the flags the production code reads or sets.
@@ -181,6 +183,24 @@ function makeFakeExtension(timeline: string[], options: { onStart?: (settings: E
       timeline.push("ready");
 
       return options.ready ?? true;
+    }
+
+    // The raw recorder's functions are matched by name first, since their bodies mention the extension's own protocol in comments.
+    if(source.includes("function startRawRecording")) {
+
+      starts++;
+      calls.push({ arg, kind: "rawStart" });
+      timeline.push("start");
+
+      return options.onStart?.(arg as ExtensionRecordingSettings, starts);
+    }
+
+    if(source.includes("function stopRawRecording")) {
+
+      calls.push({ arg, kind: "rawStop" });
+      timeline.push("stop");
+
+      return undefined;
     }
 
     if(source.includes("START_RECORDING")) {
@@ -457,6 +477,59 @@ describe("acquireCaptureStream", () => {
     await stream.stop();
 
     assert.equal(extension.calls.filter((call) => call.kind === "stop").length, 0, "no stop request is sent to a browser that is gone");
+  });
+
+  test("the raw recorder starts through startRawRecording with the protocol's values, inside the same selection and grant", async () => {
+
+    /* A raw capture differs from the default in what the extension is asked to run and nothing else: the selection, the attempt's handler, and the grant keys come
+     * in the same order, and the settings carry the framing values the pump parses with, so the two sides cannot drift apart.
+     */
+    const timeline: string[] = [];
+    const server = makeFakeServer(timeline);
+    const extension = makeFakeExtension(timeline);
+    const page = makeFakePage(timeline);
+    const clock = new TestClock();
+
+    await acquireCaptureStream(page.page, { ...OPTIONS, recorder: "raw" }, { clock, deps: makeDeps(extension, server) });
+
+    // The grant's modifier is the platform's, so the expectation reads it the same way the grant does.
+    const modifier = (process.platform === "darwin") ? "Meta" : "Control";
+
+    assert.deepEqual(timeline,
+      [ "ready", "select", "handler:on", "reassert", "down:" + modifier, "down:Shift", "press:KeyY", "up:Shift", "up:" + modifier, "start", "release" ],
+      "the raw start runs in exactly the default start's place");
+    assert.equal(extension.calls.filter((call) => call.kind === "start").length, 0, "the extension's MediaRecorder is never started");
+
+    const start = extension.calls.find((call) => call.kind === "rawStart");
+
+    assert.deepEqual(start?.arg, {
+
+      audio: true,
+      formatCodes: RAW_PIXEL_FORMATS,
+      headerSize: RAW_HEADER_SIZE,
+      index: (start?.arg as RawRecordingSettings).index,
+      kinds: { audio: RAW_KIND_AUDIO, video: RAW_KIND_VIDEO },
+      maxBufferedBytes: RAW_CAPTURE_MAX_BUFFERED_BYTES,
+      video: true,
+      videoConstraints: OPTIONS.videoConstraints
+    }, "the raw settings carry the capture's shape and the framing constants");
+  });
+
+  test("stop() on a raw capture asks stopRawRecording, once, for its own index", async () => {
+
+    const timeline: string[] = [];
+    const server = makeFakeServer(timeline);
+    const extension = makeFakeExtension(timeline);
+    const page = makeFakePage(timeline);
+    const clock = new TestClock();
+    const stream = await acquireCaptureStream(page.page, { ...OPTIONS, recorder: "raw" }, { clock, deps: makeDeps(extension, server) });
+
+    await Promise.all([ stream.stop(), stream.stop() ]);
+
+    const index = (extension.calls.find((call) => call.kind === "rawStart")?.arg as RawRecordingSettings).index;
+
+    assert.deepEqual(extension.calls.filter((call) => call.kind === "rawStop").map((call) => call.arg), [index], "one raw stop, for the capture's own index");
+    assert.equal(extension.calls.filter((call) => call.kind === "stop").length, 0, "the extension's own stop is not asked for a recording it never ran");
   });
 
   test("a source-unavailable refusal fails after a single start and logs the window and tab state", async () => {

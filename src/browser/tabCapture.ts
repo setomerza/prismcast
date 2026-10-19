@@ -23,6 +23,8 @@
  * suite with instructions rather than failing a capture in the field.
  */
 import { LOG, formatError, pollUntil, startTimer, toError } from "../utils/index.ts";
+import { RAW_CAPTURE_MAX_BUFFERED_BYTES, RAW_HEADER_SIZE, RAW_KIND_AUDIO, RAW_KIND_VIDEO, RAW_PIXEL_FORMATS, startRawRecording,
+  stopRawRecording } from "./rawCapture.ts";
 import type { RawData, WebSocket, WebSocketServer } from "ws";
 import { getExtensionPage, wss } from "puppeteer-stream";
 import { CAPTURE_SOURCE_UNAVAILABLE_MESSAGE } from "../types/index.ts";
@@ -31,6 +33,7 @@ import type { IncomingMessage } from "node:http";
 import type { Nullable } from "../types/index.ts";
 import type { Page } from "puppeteer-core";
 import { PassThrough } from "node:stream";
+import type { RawRecordingSettings } from "./rawCapture.ts";
 import type { Readable } from "node:stream";
 import type { SelectedTab } from "./tabSelection.ts";
 import { readWindowState } from "./cdp.ts";
@@ -93,14 +96,22 @@ export interface CaptureVideoConstraints {
 }
 
 /**
+ * Which recorder a capture runs in the extension page. "mediaRecorder" is the extension's own START_RECORDING, where Chrome encodes. "raw" is PrismCast's
+ * startRawRecording (browser/rawCapture.ts), which sends unencoded frames for FFmpeg to encode.
+ */
+export type CaptureRecorder = "mediaRecorder" | "raw";
+
+/**
  * What a caller asks a capture for. videoConstraints is required rather than optional because every caller supplies one and it is the only thing tying the
- * encoder to the emulated surface; a capture acquired without it would silently compose whatever the window was presenting.
+ * encoder to the emulated surface; a capture acquired without it would silently compose whatever the window was presenting. recorder defaults to
+ * "mediaRecorder"; mimeType and the bitrates only apply to that recorder.
  */
 export interface CaptureStreamOptions {
 
   readonly audio: boolean;
   readonly audioBitsPerSecond?: number;
   readonly mimeType: string;
+  readonly recorder?: CaptureRecorder;
   readonly video: boolean;
   readonly videoBitsPerSecond?: number;
   readonly videoConstraints: CaptureVideoConstraints;
@@ -303,13 +314,33 @@ async function grantActiveTab(page: Page): Promise<void> {
 }
 
 /**
- * Runs one START_RECORDING evaluate against the extension for a prepared attempt.
+ * Runs one start evaluate against the extension for a prepared attempt: START_RECORDING for the MediaRecorder, or startRawRecording for raw frames. Both connect
+ * back under the attempt's index and reject with Chrome's own message, so everything around the start treats them alike.
  * @param extension - The extension's options page.
  * @param attempt - The prepared attempt whose index and stream the recording feeds.
  * @param options - What the caller asked the capture for.
  * @param tabId - The tab Chrome will capture.
  */
 async function startRecording(extension: Page, attempt: CaptureAttempt, options: CaptureStreamOptions, tabId: number): Promise<void> {
+
+  if(options.recorder === "raw") {
+
+    const rawSettings: RawRecordingSettings = {
+
+      audio: options.audio,
+      formatCodes: RAW_PIXEL_FORMATS,
+      headerSize: RAW_HEADER_SIZE,
+      index: attempt.index,
+      kinds: { audio: RAW_KIND_AUDIO, video: RAW_KIND_VIDEO },
+      maxBufferedBytes: RAW_CAPTURE_MAX_BUFFERED_BYTES,
+      video: options.video,
+      videoConstraints: options.videoConstraints
+    };
+
+    await extension.evaluate(startRawRecording, rawSettings);
+
+    return;
+  }
 
   const settings: ExtensionRecordingSettings = {
 
@@ -401,11 +432,12 @@ async function acquireOnce(page: Page, options: CaptureStreamOptions,
 /**
  * Attaches the two capture-control members to a started attempt's stream, producing the CaptureStream its owner holds.
  * @param attempt - The attempt that started.
- * @param extension - The extension's options page, which STOP_RECORDING is evaluated against.
+ * @param extension - The extension's options page, which the stop is evaluated against.
  * @param server - The WebSocket server the attempt registered on.
+ * @param recorder - The recorder the attempt started, which decides the stop function.
  * @returns The owner-facing capture stream.
  */
-function attachCaptureControls(attempt: CaptureAttempt, extension: Page, server: WebSocketServer): CaptureStream {
+function attachCaptureControls(attempt: CaptureAttempt, extension: Page, server: WebSocketServer, recorder: CaptureRecorder = "mediaRecorder"): CaptureStream {
 
   let stopping = false;
 
@@ -417,7 +449,13 @@ function attachCaptureControls(attempt: CaptureAttempt, extension: Page, server:
 
       try {
 
-        await extension.evaluate((index: number) => STOP_RECORDING(index), attempt.index);
+        if(recorder === "raw") {
+
+          await extension.evaluate(stopRawRecording, attempt.index);
+        } else {
+
+          await extension.evaluate((index: number) => STOP_RECORDING(index), attempt.index);
+        }
       } catch(error) {
 
         LOG.debug("browser:lifecycle", "The capture extension did not accept the stop request: %s.", formatError(error));
@@ -485,7 +523,7 @@ export async function acquireCaptureStream(page: Page, options: CaptureStreamOpt
   try {
 
     const started = await acquireOnce(page, options, { clock, deps, extension, server });
-    const stream = attachCaptureControls(started, extension, server);
+    const stream = attachCaptureControls(started, extension, server, options.recorder);
 
     /* Both close paths end the recording. The owner's disposer destroys the stream, which emits close; a page that dies takes its capture with it and fires
      * the page's own close. Registering here rather than inside the socket handler means a capture whose socket never connected still stops cleanly.
