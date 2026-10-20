@@ -6,16 +6,17 @@
  * video and raw audio from pipes has no timestamps at all: it counts frames and samples. So the pump's job is to turn timestamped, irregular arrivals into two
  * perfectly regular streams that start together:
  *
- * - Video becomes exactly frameRate frames per second of yuv420p at the stream's size. A frame lands in the output slot its timestamp names; a slot no frame
- *   reached is filled by repeating the previous frame, and a frame that arrives for a slot already written is not written (it still becomes the frame the next
- *   repeat uses).
- * - Audio becomes continuous 48 kHz stereo 32-bit float. A block lands at the sample its timestamp names; a small disagreement is absorbed as jitter, a gap is
- *   filled with silence, and an overlap is trimmed.
+ * - Video becomes exactly frameRate frames per second of yuv420p at the stream's size. A frame lands in the output slot its timestamp names, measured from the
+ *   first frame's; a slot no frame reached is filled by repeating the previous frame, and a frame that arrives for a slot already written is not written (it still
+ *   becomes the frame the next repeat uses). A jump of more than RAW_MAX_GAP_US either way - a stall, or the track's clock restarting - re-anchors the track so
+ *   the frame takes the next slot, rather than filling seconds of repeats.
+ * - Audio becomes continuous 48 kHz stereo 32-bit float. A block lands at the sample its timestamp names, measured from an anchor; a small disagreement is absorbed
+ *   as jitter, a gap is filled with silence, and an overlap is trimmed.
  *
- * Both are measured from one shared origin, the first video frame's timestamp. Audio that arrives before it is dropped, and audio that starts after it is preceded
- * by silence, so the two pipes start in step and stay in step for as long as Chrome's clock does. When nothing at all arrives from either stream for longer than
- * RAW_MAX_GAP_US - the tab stalled, rather than jitter or one quiet track - the origin moves past the gap for both streams at once instead of the pipes being
- * filled with seconds of repeats and silence. A gap in one stream while the other flows is filled, because that one is real time passing.
+ * Chrome does not promise that a capture's audio and video timestamps share a time base, so neither track's timestamps are compared with the other's. Instead the
+ * audio is anchored to the video's output position: its first block lands where the video output stands at that moment, and a block that disagrees with its
+ * anchor by more than RAW_MAX_GAP_US is re-anchored the same way. Both tracks are live and processed as they arrive, so the video's output position at any moment
+ * is the elapsed capture time, and the two pipes start and stay in step. Audio that arrives before the first frame has nothing to anchor to and is dropped.
  */
 import { RAW_HEADER_SIZE, RAW_KIND_AUDIO, RAW_KIND_VIDEO, RAW_PIXEL_FORMATS } from "../browser/rawCapture.ts";
 import { LOG } from "../utils/index.ts";
@@ -31,7 +32,7 @@ export const RAW_AUDIO_CHANNELS = 2;
 // Capture timestamps are in microseconds.
 const MICROSECONDS_PER_SECOND = 1000000;
 
-// A gap in either stream longer than this is a stall rather than jitter: the shared origin moves instead of the gap being filled.
+// A timestamp jump longer than this is a stall or a clock restart rather than jitter: the track re-anchors instead of the gap being filled.
 export const RAW_MAX_GAP_US = 2000000;
 
 // The audio disagreement absorbed as jitter rather than corrected, in samples: 20ms.
@@ -86,12 +87,12 @@ export interface RawMessageParser {
 }
 
 /**
- * The origin both pacers measure from - the first video frame's capture timestamp, moved forward by stalls - and the latest timestamp either stream has shown.
+ * What the video pacer publishes for the audio pacer to anchor to: the output time, in microseconds, at which the latest written frame starts, or null before the
+ * first frame.
  */
 export interface RawTimeline {
 
-  latestUs: Nullable<number>;
-  originUs: Nullable<number>;
+  videoPositionUs: Nullable<number>;
 }
 
 /**
@@ -306,65 +307,40 @@ function rgbToI420(data: Buffer, width: number, height: number, bgr: boolean): B
 }
 
 /**
- * Records a timestamp on the shared timeline. When it lands more than RAW_MAX_GAP_US after the latest one either stream has shown, nothing arrived from the tab
- * for that long, and the origin moves forward by the gap so both pacers carry on from where they were rather than filling it.
- * @param timeline - The shared timeline, with its origin already set.
- * @param timestampUs - The arriving timestamp.
- * @returns True when the timestamp ended a stall.
- */
-export function observeTimestamp(timeline: RawTimeline, timestampUs: number): boolean {
-
-  const latest = timeline.latestUs;
-
-  if((latest === null) || (timestampUs <= latest)) {
-
-    timeline.latestUs ??= timestampUs;
-
-    return false;
-  }
-
-  timeline.latestUs = timestampUs;
-
-  if(((timestampUs - latest) > RAW_MAX_GAP_US) && (timeline.originUs !== null)) {
-
-    timeline.originUs += timestampUs - latest;
-
-    return true;
-  }
-
-  return false;
-}
-
-/**
  * Creates the video pacer: the decision of which output slot each frame fills.
- * @param timeline - The origin shared with the audio pacer. The first frame sets it.
+ * @param timeline - Where the pacer publishes its output position for the audio pacer.
  * @param frameRate - The output frame rate.
- * @param onStall - Invoked when a frame ended a stall.
+ * @param onStall - Invoked when a jump re-anchored the track.
  * @returns The placement function, given a frame's capture timestamp in microseconds.
  */
 export function createVideoPacer(timeline: RawTimeline, frameRate: number, onStall: () => void = (): void => { /* No stall observer. */ }):
 (timestampUs: number) => VideoPlacement {
 
   const intervalUs = MICROSECONDS_PER_SECOND / frameRate;
+  const maxGapSlots = Math.ceil(RAW_MAX_GAP_US / intervalUs);
+  let originUs: Nullable<number> = null;
   let written = 0;
 
-  return (timestampUs: number): VideoPlacement => {
+  const place = (timestampUs: number): VideoPlacement => {
 
-    if(timeline.originUs === null) {
+    // The first frame, or a frame after a jump: the track is anchored so this frame takes the next slot.
+    if(originUs === null) {
 
-      timeline.originUs = timestampUs;
-      timeline.latestUs = timestampUs;
-      written = 1;
+      originUs = timestampUs - (written * intervalUs);
+      written++;
 
       return { emit: true, repeats: 0 };
     }
 
-    if(observeTimestamp(timeline, timestampUs)) {
+    const slot = Math.round((timestampUs - originUs) / intervalUs);
 
+    if(Math.abs(slot - written) > maxGapSlots) {
+
+      originUs = null;
       onStall();
-    }
 
-    const slot = Math.round((timestampUs - timeline.originUs) / intervalUs);
+      return place(timestampUs);
+    }
 
     // A frame for a slot already written: its content waits for the next repeat.
     if(slot < written) {
@@ -377,6 +353,16 @@ export function createVideoPacer(timeline: RawTimeline, frameRate: number, onSta
     written = slot + 1;
 
     return { emit: true, repeats };
+  };
+
+  return (timestampUs: number): VideoPlacement => {
+
+    const placement = place(timestampUs);
+
+    // The output time at which the latest frame starts: the moment of capture the newest arrivals correspond to.
+    timeline.videoPositionUs = (written - 1) * intervalUs;
+
+    return placement;
   };
 }
 
@@ -428,27 +414,40 @@ export function toStereoOutput(block: RawAudioMessage): Float32Array {
 }
 
 /**
- * Creates the audio pacer: the decision of where each block lands on the shared timeline.
- * @param timeline - The origin shared with the video pacer. Audio waits for video to set it.
+ * Creates the audio pacer: the decision of where each block lands in the audio output.
+ * @param timeline - The video pacer's published output position, which the audio anchors to.
  * @param onAdjust - Invoked with the silence padded (positive) or samples trimmed (negative) for a block.
  * @returns The placement function, given a block's capture timestamp and its interleaved stereo samples; it returns what to write, which may be empty.
  */
 export function createAudioPacer(timeline: RawTimeline, onAdjust: (frames: number) => void = (): void => { /* No adjustment observer. */ }):
 (timestampUs: number, samples: Float32Array) => Float32Array {
 
+  const maxGapSamples = Math.round(RAW_MAX_GAP_US * RAW_AUDIO_SAMPLE_RATE / MICROSECONDS_PER_SECOND);
+  let anchor: Nullable<{ sample: number; timestampUs: number }> = null;
   let written = 0;
+
+  // The output sample the video has reached, which is where an anchored block lands.
+  const videoSample = (): number => Math.round((timeline.videoPositionUs ?? 0) * RAW_AUDIO_SAMPLE_RATE / MICROSECONDS_PER_SECOND);
 
   return (timestampUs: number, samples: Float32Array): Float32Array => {
 
-    // Audio ahead of the first video frame has nothing to align to.
-    if(timeline.originUs === null) {
+    // Audio ahead of the first video frame has nothing to anchor to.
+    if(timeline.videoPositionUs === null) {
 
       return new Float32Array(0);
     }
 
-    observeTimestamp(timeline, timestampUs);
+    anchor ??= { sample: videoSample(), timestampUs };
 
-    const target = Math.round((timestampUs - timeline.originUs) * RAW_AUDIO_SAMPLE_RATE / MICROSECONDS_PER_SECOND);
+    let target = anchor.sample + Math.round((timestampUs - anchor.timestampUs) * RAW_AUDIO_SAMPLE_RATE / MICROSECONDS_PER_SECOND);
+
+    // A block that disagrees with its anchor by more than the gap limit - a stall, or the track's clock restarting - is re-anchored to the video's position.
+    if(Math.abs(target - written) > maxGapSamples) {
+
+      anchor = { sample: videoSample(), timestampUs };
+      target = anchor.sample;
+    }
+
     const frames = samples.length / RAW_AUDIO_CHANNELS;
     const offset = target - written;
 
@@ -493,7 +492,7 @@ export function createRawPump(options: RawPumpOptions): RawPump {
 
   const { audioOut, frameRate, height, maxBufferedBytes = RAW_PUMP_MAX_BUFFERED_BYTES, videoOut, width } = options;
   const stats: RawPumpStats = { audioSamplesPadded: 0, audioSamplesTrimmed: 0, framesDropped: 0, framesRejected: 0, framesRepeated: 0, framesWritten: 0, stalls: 0 };
-  const timeline: RawTimeline = { latestUs: null, originUs: null };
+  const timeline: RawTimeline = { videoPositionUs: null };
   const placeVideo = createVideoPacer(timeline, frameRate, () => { stats.stalls++; });
   const placeAudio = createAudioPacer(timeline, (frames) => {
 
@@ -508,6 +507,21 @@ export function createRawPump(options: RawPumpOptions): RawPump {
 
   let lastFrame: Nullable<Buffer> = null;
   let warnedRejection = false;
+
+  // Each track's first message is logged once at debug level: its format and its timestamp are what an operator needs to see when the pipes misbehave.
+  const firstSeen = new Set<string>();
+
+  const noteFirst = (message: RawMessage): void => {
+
+    if(firstSeen.has(message.kind)) {
+
+      return;
+    }
+
+    firstSeen.add(message.kind);
+    LOG.debug("streaming:ffmpeg", "Raw capture's first %s message: timestamp %dus, %s.", message.kind, message.timestamp, (message.kind === "video") ?
+      message.format + " " + String(message.width) + "x" + String(message.height) : String(message.channels) + "ch " + String(message.sampleRate) + "Hz");
+  };
 
   const writeFrame = (frame: Buffer): void => {
 
@@ -567,6 +581,8 @@ export function createRawPump(options: RawPumpOptions): RawPump {
   };
 
   const parser = createRawMessageParser((message) => {
+
+    noteFirst(message);
 
     if(message.kind === "video") {
 

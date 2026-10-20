@@ -5,7 +5,7 @@
  * are in-memory writables, so nothing outside Node is involved.
  */
 import { RAW_AUDIO_CHANNELS, RAW_AUDIO_SAMPLE_RATE, RAW_AUDIO_TOLERANCE_SAMPLES, RAW_MAX_GAP_US, createAudioPacer, createRawMessageParser, createRawPump,
-  createVideoPacer, observeTimestamp, toI420, toStereoOutput } from "./rawPump.ts";
+  createVideoPacer, toI420, toStereoOutput } from "./rawPump.ts";
 import { RAW_HEADER_SIZE, RAW_KIND_AUDIO, RAW_KIND_VIDEO, RAW_PIXEL_FORMATS } from "../browser/rawCapture.ts";
 import type { RawAudioMessage, RawMessage, RawTimeline, RawVideoMessage } from "./rawPump.ts";
 import { describe, test } from "node:test";
@@ -263,46 +263,32 @@ describe("createVideoPacer", () => {
 
   test("places frames by timestamp: on time, late with repeats, and early without a write", () => {
 
-    const timeline: RawTimeline = { latestUs: null, originUs: null };
+    const timeline: RawTimeline = { videoPositionUs: null };
     const place = createVideoPacer(timeline, 30);
     const interval = 1000000 / 30;
 
-    assert.deepEqual(place(5000000), { emit: true, repeats: 0 }, "the first frame sets the origin and is written");
-    assert.equal(timeline.originUs, 5000000);
+    assert.deepEqual(place(5000000), { emit: true, repeats: 0 }, "the first frame anchors the track and is written");
+    assert.equal(timeline.videoPositionUs, 0, "the first frame starts the output");
     assert.deepEqual(place(5000000 + interval), { emit: true, repeats: 0 }, "the next slot, on time");
     assert.deepEqual(place(5000000 + (4 * interval)), { emit: true, repeats: 2 }, "two missed slots are repeats of the previous frame");
     assert.deepEqual(place(5000000 + (4.2 * interval)), { emit: false, repeats: 0 }, "a second frame for a slot already written is not written");
     assert.deepEqual(place(5000000 + (4.6 * interval)), { emit: true, repeats: 0 }, "jitter rounds to the nearest slot");
+    assert.equal(timeline.videoPositionUs, 5 * interval, "the sixth frame starts five intervals in");
   });
 
-  test("a stall moves the origin instead of filling the gap, and says so", () => {
+  test("a jump either way re-anchors the track instead of filling the gap, and says so", () => {
 
-    const timeline: RawTimeline = { latestUs: null, originUs: null };
+    const timeline: RawTimeline = { videoPositionUs: null };
     let stalls = 0;
     const place = createVideoPacer(timeline, 30, () => { stalls++; });
 
     place(0);
     place(33333);
 
-    const placement = place(33333 + RAW_MAX_GAP_US + 500000);
-
-    assert.equal(stalls, 1, "the stall was reported");
-    assert.ok(placement.repeats <= 1, "the gap was not filled with repeats");
-    assert.equal(timeline.originUs, RAW_MAX_GAP_US + 500000, "the origin moved by the gap");
-  });
-});
-
-describe("observeTimestamp", () => {
-
-  test("moves the origin only for a gap longer than the limit, and never backwards", () => {
-
-    const timeline: RawTimeline = { latestUs: 0, originUs: 0 };
-
-    assert.equal(observeTimestamp(timeline, RAW_MAX_GAP_US), false, "a gap at the limit is not a stall");
-    assert.equal(observeTimestamp(timeline, RAW_MAX_GAP_US - 10), false, "an older timestamp changes nothing");
-    assert.equal(timeline.latestUs, RAW_MAX_GAP_US);
-    assert.equal(observeTimestamp(timeline, (3 * RAW_MAX_GAP_US) + 1), true, "a longer gap is a stall");
-    assert.equal(timeline.originUs, (2 * RAW_MAX_GAP_US) + 1);
+    assert.deepEqual(place(33333 + RAW_MAX_GAP_US + 500000), { emit: true, repeats: 0 }, "a forward jump takes the next slot with no repeats");
+    assert.deepEqual(place(33333 + RAW_MAX_GAP_US + 533333), { emit: true, repeats: 0 }, "and the track carries on from its new anchor");
+    assert.deepEqual(place(10), { emit: true, repeats: 0 }, "a clock that restarts backwards also takes the next slot");
+    assert.equal(stalls, 2, "both jumps were reported");
   });
 });
 
@@ -310,23 +296,40 @@ describe("createAudioPacer", () => {
 
   const samples = (frames: number, value = 0.5): Float32Array => new Float32Array(frames * RAW_AUDIO_CHANNELS).fill(value);
 
-  test("drops audio until video sets the origin, then writes in place within tolerance", () => {
+  test("drops audio until video starts, then anchors at the video's position whatever the audio's time base", () => {
 
-    const timeline: RawTimeline = { latestUs: null, originUs: null };
+    const timeline: RawTimeline = { videoPositionUs: null };
     const place = createAudioPacer(timeline);
 
-    assert.equal(place(0, samples(480)).length, 0, "no origin yet");
+    assert.equal(place(0, samples(480)).length, 0, "no video yet");
 
-    timeline.originUs = 1000000;
-    timeline.latestUs = 1000000;
+    // The audio's clock is unrelated to the video's: its timestamps are in the billions while the video's started at zero. The video has written 100ms.
+    timeline.videoPositionUs = 100000;
 
-    assert.equal(place(1000000, samples(480)).length, 480 * 2, "on time");
-    assert.equal(place(1015000, samples(480)).length, 480 * 2, "5ms late is jitter");
+    const first = place(9000000000, samples(480));
+
+    assert.equal(first.length, (4800 + 480) * 2, "the first block lands at the video's 100ms, after that much silence");
+    assert.equal(place(9000010000, samples(480)).length, 480 * 2, "the next block follows on its own clock");
+    assert.equal(place(9000025000, samples(480)).length, 480 * 2, "5ms late is jitter");
+  });
+
+  test("re-anchors a block that disagrees with its anchor by more than the gap limit", () => {
+
+    const timeline: RawTimeline = { videoPositionUs: 0 };
+    const place = createAudioPacer(timeline);
+
+    place(0, samples(480));
+    timeline.videoPositionUs = 500000;
+
+    // The audio clock jumps three seconds; the video has only moved to 500ms, so the block lands there, after the silence that brings the audio level.
+    const placed = place(RAW_MAX_GAP_US + 1000000, samples(480));
+
+    assert.equal(placed.length, ((24000 - 480) + 480) * 2, "the block landed at the video's position");
   });
 
   test("pads a gap with silence and trims an overlap", () => {
 
-    const timeline: RawTimeline = { latestUs: 0, originUs: 0 };
+    const timeline: RawTimeline = { videoPositionUs: 0 };
     const adjustments: number[] = [];
     const place = createAudioPacer(timeline, (frames) => { adjustments.push(frames); });
 
