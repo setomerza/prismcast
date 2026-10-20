@@ -76,8 +76,9 @@ export interface CaptureSession extends Disposable {
  */
 export interface CreateCaptureSessionOptions {
 
-  // The FFmpeg child remuxing the Matroska capture to fMP4, whose stdout is the pipeline output the segmenter consumes.
-  readonly ffmpegProcess: FFmpegProcess;
+  // The FFmpeg child remuxing the Matroska capture to fMP4, whose stdout is the pipeline output the segmenter consumes. Only its kill and its output are the
+  // session's, so the encoder mode's deferred encoder, which has no child until the video plays, stands in for one.
+  readonly ffmpegProcess: Pick<FFmpegProcess, "kill" | "stdout">;
 
   // The raw stream from the tab capture. Destroyed during disposal to release Chrome's tabCapture state while the browser is still connected.
   readonly rawCaptureStream: Readable;

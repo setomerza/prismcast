@@ -79,13 +79,20 @@ export interface RawPumpStats {
 }
 
 /**
- * What a pump is built with: the pipe to write, and when the encoder it feeds started, by the clock the pump paces against.
+ * What a pump whose encoder starts later is built with: the clock it paces against, and how much unwritten audio it tolerates.
  */
-export interface RawPumpOptions {
+export interface DeferredRawPumpOptions {
 
-  readonly audioOut: Writable;
   readonly clock?: Clock;
   readonly maxBufferedBytes?: number;
+}
+
+/**
+ * What a pump is built with: the pipe to write, and when the encoder it feeds started, by the clock the pump paces against.
+ */
+export interface RawPumpOptions extends DeferredRawPumpOptions {
+
+  readonly audioOut: Writable;
 
   // The clock's reading, in milliseconds, when the encoder FFmpeg was spawned: the moment its grabbed video's timeline starts.
   readonly startedAt: number;
@@ -97,6 +104,16 @@ export interface RawPumpOptions {
 export interface RawPump extends Writable {
 
   readonly stats: RawPumpStats;
+}
+
+/**
+ * A pump whose encoder is not running yet. The capture is piped into it from its first byte, so the framing is followed throughout, and the audio is discarded
+ * until start() names the pipe and the encoder's start; from then on it paces exactly as a pump built with them does.
+ */
+export interface DeferredRawPump extends RawPump {
+
+  // Starts writing to audioOut, level with the wall clock since startedAt. Only the first call counts.
+  readonly start: (audioOut: Writable, startedAt: number) => void;
 }
 
 // Parsing.
@@ -265,26 +282,37 @@ export function createAudioPacer(elapsedUs: () => number, onAdjust: (frames: num
  */
 export function createRawPump(options: RawPumpOptions): RawPump {
 
-  const { audioOut, clock = systemClock, maxBufferedBytes = RAW_PUMP_MAX_BUFFERED_BYTES, startedAt } = options;
+  const pump = createDeferredRawPump(options);
+
+  pump.start(options.audioOut, options.startedAt);
+
+  return pump;
+}
+
+/**
+ * Creates a pump whose encoder starts later. Until start() it parses the capture and drops its audio; a capture that ends before then ends the pipe as soon as
+ * start() names it.
+ * @param options - The clock and the buffering limit.
+ * @returns The pump.
+ */
+export function createDeferredRawPump(options: DeferredRawPumpOptions = {}): DeferredRawPump {
+
+  const { clock = systemClock, maxBufferedBytes = RAW_PUMP_MAX_BUFFERED_BYTES } = options;
   const stats: RawPumpStats = { blocksWritten: 0, reanchors: 0, samplesPadded: 0, samplesTrimmed: 0 };
-  const place = createAudioPacer(() => (clock.now() - startedAt) * MICROSECONDS_PER_MILLISECOND, (frames) => {
-
-    if(frames > 0) {
-
-      stats.samplesPadded += frames;
-    } else {
-
-      stats.samplesTrimmed -= frames;
-    }
-  }, () => { stats.reanchors++; });
+  let target: Nullable<{ audioOut: Writable; place: (timestampUs: number, samples: Float32Array) => Float32Array }> = null;
 
   const parser = createRawMessageParser((message) => {
 
-    const samples = place(message.timestamp, toStereoOutput(message));
+    if(!target) {
+
+      return;
+    }
+
+    const samples = target.place(message.timestamp, toStereoOutput(message));
 
     if(samples.length > 0) {
 
-      audioOut.write(Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength));
+      target.audioOut.write(Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength));
       stats.blocksWritten++;
     }
   });
@@ -293,7 +321,7 @@ export function createRawPump(options: RawPumpOptions): RawPump {
 
     final: (callback): void => {
 
-      audioOut.end();
+      target?.audioOut.end();
       callback();
     },
 
@@ -309,9 +337,9 @@ export function createRawPump(options: RawPumpOptions): RawPump {
         return;
       }
 
-      if(audioOut.writableLength > maxBufferedBytes) {
+      if(target && (target.audioOut.writableLength > maxBufferedBytes)) {
 
-        callback(new Error("The encoder stopped reading its audio: " + String(Math.round(audioOut.writableLength / 1024)) + "KB are waiting."));
+        callback(new Error("The encoder stopped reading its audio: " + String(Math.round(target.audioOut.writableLength / 1024)) + "KB are waiting."));
 
         return;
       }
@@ -320,5 +348,33 @@ export function createRawPump(options: RawPumpOptions): RawPump {
     }
   });
 
-  return Object.assign(pump, { stats });
+  const start = (audioOut: Writable, startedAt: number): void => {
+
+    if(target) {
+
+      return;
+    }
+
+    target = {
+
+      audioOut,
+      place: createAudioPacer(() => (clock.now() - startedAt) * MICROSECONDS_PER_MILLISECOND, (frames) => {
+
+        if(frames > 0) {
+
+          stats.samplesPadded += frames;
+        } else {
+
+          stats.samplesTrimmed -= frames;
+        }
+      }, () => { stats.reanchors++; })
+    };
+
+    if(pump.writableFinished) {
+
+      audioOut.end();
+    }
+  };
+
+  return Object.assign(pump, { start, stats });
 }

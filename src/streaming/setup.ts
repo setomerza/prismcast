@@ -9,7 +9,7 @@ import { BrowserCaptureImpairedError, BrowserSupersededError, BrowserUnavailable
 import { CAPTURE_SOURCE_UNAVAILABLE_MESSAGE, isChannelSelectionProfile } from "../types/index.ts";
 import { CaptureAbandonedError, CaptureTurnTimeoutError, createCaptureLock } from "./captureLock.ts";
 import type { CaptureStream, CaptureStreamOptions } from "../browser/index.ts";
-import type { FFmpegProcess, FFmpegVideoEncoder } from "../utils/index.ts";
+import type { EncoderFFmpegProcess, FFmpegProcess, FFmpegVideoEncoder } from "../utils/index.ts";
 import { FINALIZE_SETTLE_DELAY, installManifestInterceptor } from "../browser/manifestInterceptor.ts";
 import { LOG, chromeFetch, extractDomain, formatError, getStreamContext, isFFmpegVideoEncoder, maxRetryDuration, registerAbortController,
   resolveEncoderFFmpegPath, resolveFFmpegPath, retryOperation, runWithStreamContext, spawnEncoderFFmpeg, spawnFFmpeg, startTimer, timeoutSignal, toError,
@@ -26,13 +26,14 @@ import { CONFIG } from "../config/index.ts";
 import type { CaptureSession } from "./captureSession.ts";
 import type { CaptureWindow } from "../browser/captureWindows.ts";
 import type { Clock } from "homebridge-plugin-utils";
+import type { DeferredEncoder } from "./deferredEncoder.ts";
 import type { InitializePlaybackOptions } from "../browser/video.ts";
 import type { MonitorStreamInfo } from "./monitor.ts";
 import type { ProbeCacheIdentity } from "../native/probe.ts";
 import type { StreamSettings } from "../config/streamSettings.ts";
 import type { Writable } from "node:stream";
 import { createCaptureSession } from "./captureSession.ts";
-import { createRawPump } from "./rawPump.ts";
+import { createDeferredEncoder } from "./deferredEncoder.ts";
 import { getBuiltinProfile } from "../config/sites.ts";
 import { getCachedEncryption } from "../native/probe.ts";
 import { getCaptureMimeType } from "./codec.ts";
@@ -785,6 +786,9 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
   // The capture-pipeline composite, assigned once the raw capture stream and its FFmpeg child exist and registered on the DisposableStack the moment it is built.
   let captureSession: CaptureSession;
 
+  // The encoder mode's encoder, held back until the video is playing in the capture window. Null on the default path.
+  let encoder: Nullable<DeferredEncoder> = null;
+
   // Initialize media stream capture. The whole capture-init phase runs inside one try so a browser crash detected at turn grant drives the closed-page recursion,
   // while every other failure unwinds through the DisposableStack.
   try {
@@ -879,53 +883,69 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
     /* In the encoder mode FFmpeg encodes rather than remuxes: it grabs the video from the capture window's rectangle of the X display, stamping it with the wall
      * clock from its start, and the pump between the capture and FFmpeg turns the raw recorder's audio into PCM level with that clock on the extra pipe. The
      * capture is piped into the pump instead of into FFmpeg. Keyframes land every segment duration, because the segmenter cuts there.
+     *
+     * The encoder is not spawned here, though. Until the tune below has the video playing and filling the window, the grab would record the site's page, so the
+     * deferred encoder stands in for it - the pump drops the capture's audio meanwhile - and the establishment starts it once the tune is done.
      */
-    let ffmpeg: FFmpegProcess;
+    let ffmpeg: Pick<FFmpegProcess, "isShuttingDown" | "kill" | "stdout">;
     let captureSink: Writable;
 
     if(encoderPlan && captureWindow) {
 
-      const startedAt = systemClock.now();
-      const encoderProcess = spawnEncoder(encoderPlan.ffmpegBin, {
+      const plan = encoderPlan;
+      const rect = captureWindow.rect;
+      const deferred = createDeferredEncoder({
 
-        audioBitrate: settings.audioBitsPerSecond,
-        comment,
-        encoder: encoderPlan.encoder,
-        frameRate: settings.frameRate,
-        grab: { display: process.env["DISPLAY"] ?? ":99", x: captureWindow.rect.x, y: captureWindow.rect.y },
-        height: captureWindow.rect.height,
-        keyframeInterval: Math.max(1, Math.round(settings.frameRate * settings.segmentDuration)),
-        videoBitrate: settings.videoBitsPerSecond,
-        width: captureWindow.rect.width
-      }, onProcessError, streamId);
+        clock: systemClock,
+        spawn: (): EncoderFFmpegProcess => {
 
-      // The pump writes FFmpeg's audio pipe directly rather than through pipeline(), so the pipes' errors are handled here: a closed pipe is teardown's or
-      // FFmpeg's own exit, which the exit handler reports; anything else is a fault in its own right.
-      for(const input of [ encoderProcess.stdin, encoderProcess.audioIn ]) {
+          const encoderProcess = spawnEncoder(plan.ffmpegBin, {
 
-        input.on("error", (error) => {
+            audioBitrate: settings.audioBitsPerSecond,
+            comment,
+            encoder: plan.encoder,
+            frameRate: settings.frameRate,
+            grab: { display: process.env["DISPLAY"] ?? ":99", x: rect.x, y: rect.y },
+            height: rect.height,
+            keyframeInterval: Math.max(1, Math.round(settings.frameRate * settings.segmentDuration)),
+            videoBitrate: settings.videoBitsPerSecond,
+            width: rect.width
+          }, onProcessError, streamId);
 
-          const errorMessage = formatError(error);
+          // The pump writes FFmpeg's audio pipe directly rather than through pipeline(), so the pipes' errors are handled here: a closed pipe is teardown's or
+          // FFmpeg's own exit, which the exit handler reports; anything else is a fault in its own right.
+          for(const input of [ encoderProcess.stdin, encoderProcess.audioIn ]) {
 
-          if(errorMessage.includes("EPIPE") || errorMessage.includes("write after end") || encoderProcess.isShuttingDown()) {
+            input.on("error", (error) => {
 
-            LOG.debug("streaming:ffmpeg", "FFmpeg encoder input closed: %s.", errorMessage);
+              const errorMessage = formatError(error);
 
-            return;
+              if(errorMessage.includes("EPIPE") || errorMessage.includes("write after end") || deferred.isShuttingDown()) {
+
+                LOG.debug("streaming:ffmpeg", "FFmpeg encoder input closed: %s.", errorMessage);
+
+                return;
+              }
+
+              LOG.error("FFmpeg encoder input error: %s.", errorMessage);
+              deferred.kill();
+              onFFmpegError?.(error);
+            });
           }
 
-          LOG.error("FFmpeg encoder input error: %s.", errorMessage);
-          encoderProcess.kill();
-          onFFmpegError?.(error);
-        });
-      }
+          return encoderProcess;
+        }
+      });
 
-      ffmpeg = encoderProcess;
-      captureSink = createRawPump({ audioOut: encoderProcess.audioIn, startedAt });
+      encoder = deferred;
+      ffmpeg = deferred;
+      captureSink = deferred.audioSink;
     } else {
 
-      ffmpeg = deps.spawnFFmpeg(ffmpegBin, settings.audioBitsPerSecond, onProcessError, streamId, comment);
-      captureSink = ffmpeg.stdin;
+      const remuxer = deps.spawnFFmpeg(ffmpegBin, settings.audioBitsPerSecond, onProcessError, streamId, comment);
+
+      ffmpeg = remuxer;
+      captureSink = remuxer.stdin;
     }
 
     /* A disposed pipeline must never fire its error callback. The listeners below sit on the process's own streams rather than inside the spawn wrapper, so
@@ -1175,6 +1195,15 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
   // Re-settle the window now that the page is established, handing the sync the page it should use for the CDP session. Navigation activates the window on macOS,
   // so a pass here settles it against the policy after the tune, as every other transition does.
   await deps.syncWindowVisibility(page);
+
+  // The video is playing and filling the capture window, and the window is settled, so the encoder mode's grab starts here: what it records from its first frame
+  // is the channel.
+  if(encoder) {
+
+    encoder.start();
+
+    LOG.debug("timing:startup", "Encoder started with the video playing. (+%sms)", captureElapsed());
+  }
 
   LOG.debug("timing:startup", "Page with capture ready. Total: %sms.", captureElapsed());
 

@@ -6,7 +6,7 @@
  * capture asks the extension for the raw audio recorder, the FFmpeg spawned is the encoder - grabbing the window's rectangle of the screen, with its audio pipe -
  * rather than the remuxer, and the capture is piped into the audio pump rather than into FFmpeg. These rows drive the real createPageWithCapture on the static
  * branch, as setup.ffmpegWiring.test.ts does, with the page opened, the capture options, and both spawns recorded, so each row reads which path an establishment
- * took, what the encoder was asked for, and that a stream with no encoder or no window falls back to the default path rather than failing.
+ * took, what the encoder was asked for, when it was started, and that a stream with no encoder or no window falls back to the default path rather than failing.
  */
 import type { Browser, Page } from "puppeteer-core";
 import type { CaptureStream, CaptureStreamOptions } from "../browser/tabCapture.ts";
@@ -41,6 +41,7 @@ let captureStream: PassThrough;
 let encoderSpawns: { bin: string; options: EncoderFFmpegOptions }[];
 let encoderProcess: EncoderFFmpegProcess & { kills: () => number };
 let faults: Error[];
+let onGoto: () => Promise<void>;
 let openedPages: string[];
 let releases: number;
 let remuxSpawns: number;
@@ -63,7 +64,7 @@ function makeStubPage(tag: string): Page {
 
     close: async (): Promise<void> => { emitter.emit("close"); },
     evaluateOnNewDocument: async (): Promise<void> => { /* No real document on a stub. */ },
-    goto: async (): Promise<void> => { /* The static branch navigates once. */ },
+    goto: async (): Promise<void> => onGoto(),
     isClosed: (): boolean => false,
     once: (event: string, listener: () => void): unknown => emitter.once(event, listener),
     setBypassCSP: async (): Promise<void> => { /* Nothing to bypass on a stub. */ }
@@ -168,6 +169,7 @@ beforeEach(() => {
   encoderSpawns = [];
   encoderProcess = { ...makeFakeFFmpeg(), audioIn: new PassThrough() };
   faults = [];
+  onGoto = async (): Promise<void> => { /* The static branch navigates once. */ };
   openedPages = [];
   releases = 0;
   remuxSpawns = 0;
@@ -219,6 +221,55 @@ describe("createPageWithCapture: the FFmpeg encoder mode", () => {
     await dispose();
 
     assert.equal(releases, 1, "closing the page returned the window's cell");
+  });
+
+  test("the encoder is spawned only once the tune is done, and the audio the capture carried during the tune is dropped", async () => {
+
+    let spawnsDuringTune = -1;
+
+    // The tune: the capture is live and carries audio while the page loads, and nothing may be grabbing yet.
+    onGoto = async (): Promise<void> => {
+
+      captureStream.write(rawAudio(480));
+      await new Promise((resolve) => setImmediate(resolve));
+      spawnsDuringTune = encoderSpawns.length;
+    };
+
+    const dispose = await establish(makeStreamSettings({ videoEncoder: "ffmpeg" }));
+
+    assert.equal(spawnsDuringTune, 0, "no encoder was running while the page was being tuned");
+    assert.equal(encoderSpawns.length, 1, "the encoder was spawned before the establishment returned");
+
+    const written: Buffer[] = [];
+
+    encoderProcess.audioIn.on("data", (chunk: Buffer) => { written.push(chunk); });
+
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const writtenBeforeStart = written.length;
+
+    assert.equal(writtenBeforeStart, 0, "the tune's audio never reached the encoder");
+
+    captureStream.write(rawAudio(480));
+
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.ok(written.length > 0, "the audio after the start did");
+
+    await dispose();
+  });
+
+  test("a tune that fails never spawns the encoder, and still returns the window", async () => {
+
+    onGoto = async (): Promise<void> => {
+
+      throw new Error("The page could not be loaded.");
+    };
+
+    await assert.rejects(establish(makeStreamSettings({ videoEncoder: "ffmpeg" })), /could not be loaded/);
+
+    assert.equal(encoderSpawns.length, 0, "nothing was grabbing a page that never played");
+    assert.equal(releases, 1, "the window's cell went back to the pool");
   });
 
   test("a host without the encoder falls back to the browser encoder without opening a window", async () => {
