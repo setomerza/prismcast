@@ -6,12 +6,17 @@
  * are exercised end-to-end against an Express server, while the helpers are tested directly.
  */
 import type { AddressInfo, Server } from "node:net";
-import { after, before, describe, test } from "node:test";
+import { after, afterEach, before, beforeEach, describe, test } from "node:test";
 import { generatePlaylistContent, resolveBaseUrl, setupPlaylistEndpoint } from "./playlist.ts";
+import { initializeUserChannels, mutateChannels } from "../config/userChannels.ts";
+import { mkdtemp, rm } from "node:fs/promises";
 import assert from "node:assert/strict";
 import { closePuppeteerStreamWss } from "../testing.helpers.ts";
 import express from "express";
+import { initializeDataDir } from "../config/paths.ts";
 import { makeReqRes } from "./express.helpers.ts";
+import os from "node:os";
+import path from "node:path";
 
 function makeServer(): Promise<{ port: number; server: Server }> {
 
@@ -217,6 +222,58 @@ describe("generatePlaylistContent", () => {
     const filteredCount = (filteredPlaylist.match(/^#EXTINF:/gm) ?? []).length;
 
     assert.equal(allCount, filteredCount, "exclude filter for nonexistent tag should keep all channels");
+  });
+});
+
+describe("generatePlaylistContent - channel numbers", () => {
+
+  let dir: string;
+
+  beforeEach(async () => {
+
+    dir = await mkdtemp(path.join(os.tmpdir(), "prismcast-playlist-test-"));
+    initializeDataDir(dir);
+    await initializeUserChannels();
+
+    await mutateChannels((data) => {
+
+      data.channels["numbered-test"] = { channelNumber: 140, name: "Numbered Test", url: "https://example.com/numbered" };
+      data.channels["unnumbered-test"] = { name: "Unnumbered Test", url: "https://example.com/unnumbered" };
+    });
+  });
+
+  // The data directory is pointed back at os.tmpdir(), a directory that exists, before the test's directory is removed.
+  afterEach(async () => {
+
+    initializeDataDir(os.tmpdir());
+    await rm(dir, { force: true, recursive: true });
+  });
+
+  /**
+   * Returns the EXTINF line for a channel key from a generated playlist.
+   * @param key - The channel key.
+   * @returns The EXTINF line, or undefined when the channel is absent.
+   */
+  function extinfFor(key: string): string | undefined {
+
+    return generatePlaylistContent("http://example.test").split("\n").find((line) => line.startsWith("#EXTINF:-1 channel-id=\"" + key + "\""));
+  }
+
+  test("emits channel-number (Channels DVR) and tvg-chno (Jellyfin) with the same value when a channel number is set", () => {
+
+    const line = extinfFor("numbered-test");
+
+    assert.ok(line, "the numbered channel should be in the playlist");
+    assert.match(line, / channel-number="140" tvg-chno="140"/);
+  });
+
+  test("omits both channel-number and tvg-chno when no channel number is set (negative test)", () => {
+
+    const line = extinfFor("unnumbered-test");
+
+    assert.ok(line, "the unnumbered channel should be in the playlist");
+    assert.doesNotMatch(line, /channel-number=/);
+    assert.doesNotMatch(line, /tvg-chno=/);
   });
 });
 

@@ -199,13 +199,14 @@ export function generatePlaylistContent(baseUrl: string, serviceFilter?: Include
     const displayName = channel.guideTitle ?? channel.name ?? name;
     const streamUrl = baseUrl + "/hls/" + name + "/stream.m3u8";
 
-    // Build the EXTINF line with required channel-id attribute and tvg-name for the friendly display name. Include channel-number when the user has specified one,
-    // tvc-guide-stationid for Gracenote guide data when a stationId is defined, tvg-shift for EPG time offset, tvg-logo for custom channel logos, and group-title
-    // for organizational tags (semicolon-delimited for IPTV middleware compatibility). Every user-controlled attribute value flows through escapeM3uAttribute so
-    // an embedded double-quote, backslash, or line break cannot terminate the attribute early or break the EXTINF line. Structurally server-controlled values
-    // (the channel key, numeric channelNumber and tvgShift, and the fixed placeholders constant) skip the helper because validation guarantees they cannot carry
-    // those characters.
-    const channelNumberAttr = channel.channelNumber ? " channel-number=\"" + String(channel.channelNumber) + "\"" : "";
+    // Build the EXTINF line with required channel-id attribute and tvg-name for the friendly display name. Include channel-number (Channels DVR) and tvg-chno
+    // (Jellyfin and other IPTV clients) when the user has specified a number, tvc-guide-stationid for Gracenote guide data when a stationId is defined,
+    // tvg-shift for EPG time offset, tvg-logo for custom channel logos, and group-title for organizational tags (semicolon-delimited for IPTV middleware
+    // compatibility). Every user-controlled attribute value flows through escapeM3uAttribute so an embedded double-quote, backslash, or line break cannot
+    // terminate the attribute early or break the EXTINF line. Structurally server-controlled values (the channel key, numeric channelNumber and tvgShift, and
+    // the fixed placeholders constant) skip the helper because validation guarantees they cannot carry those characters.
+    const channelNumberAttr = channel.channelNumber ?
+      " channel-number=\"" + String(channel.channelNumber) + "\" tvg-chno=\"" + String(channel.channelNumber) + "\"" : "";
     const groupTitleAttr = (effectiveTags.length > 0) ? " group-title=\"" + escapeM3uAttribute(effectiveTags.join(";")) + "\"" : "";
     const logoAttr = channel.logoUrl ? " tvg-logo=\"" + escapeM3uAttribute(channel.logoUrl) + "\"" : "";
     const stationIdAttr = channel.stationId ? " tvc-guide-stationid=\"" + escapeM3uAttribute(channel.stationId) + "\"" : "";
