@@ -10,6 +10,7 @@ import { CONFIG } from "../config/index.ts";
 import type { ClientType } from "../streaming/clients.ts";
 import type { HealthStatus } from "../types/index.ts";
 import { getClientSummary } from "../streaming/clients.ts";
+import { getHealthSnapshot } from "../config/health.ts";
 import { systemClock } from "homebridge-plugin-utils";
 
 /* The health endpoint provides detailed metrics about the application status including browser connection, memory usage, and active stream counts. This is useful
@@ -29,13 +30,14 @@ export interface HealthDeps {
   readonly getCaptureImpairment: typeof getCaptureImpairment;
   readonly getChromeVersion: typeof getChromeVersion;
   readonly getClientSummary: typeof getClientSummary;
+  readonly getHealthSnapshot: typeof getHealthSnapshot;
   readonly getStreamCount: typeof getStreamCount;
   readonly getTotalSegmentMemory: typeof getTotalSegmentMemory;
   readonly isBrowserConnected: typeof isBrowserConnected;
 }
 
-const defaultHealthDeps: HealthDeps = { getAllStreams, getBrowserPages, getCaptureImpairment, getChromeVersion, getClientSummary, getStreamCount,
-  getTotalSegmentMemory, isBrowserConnected };
+const defaultHealthDeps: HealthDeps = { getAllStreams, getBrowserPages, getCaptureImpairment, getChromeVersion, getClientSummary, getHealthSnapshot,
+  getStreamCount, getTotalSegmentMemory, isBrowserConnected };
 
 /**
  * The health decision: the tri-state status, its HTTP code, and the operator message. Deriving it in one place collapses what were three separate evaluations of
@@ -138,7 +140,23 @@ export function setupHealthEndpoint(app: Express, deps: HealthDeps = defaultHeal
 
     const decision = deriveHealthStatus({ browserConnected, captureImpaired, streamUtilization });
 
+    // The channel table's health indicators, summarised for monitoring: a provider asking to sign in again, or channels whose last tune failed, is what an operator
+    // needs to hear about even while the browser itself is healthy.
+    const snapshot = deps.getHealthSnapshot();
+    const auth: HealthStatus["auth"] = {};
+
+    for(const [ domain, entry ] of Object.entries(snapshot.domains).toSorted(([a], [b]) => a.localeCompare(b))) {
+
+      auth[domain] = { since: new Date(entry.timestamp).toISOString(), status: entry.status };
+    }
+
+    const channelEntries = Object.entries(snapshot.channels).toSorted(([a], [b]) => a.localeCompare(b));
+    const failed = channelEntries.filter(([ , entry ]) => entry.status === "failed")
+      .map(([ channel, entry ]) => ({ at: new Date(entry.timestamp).toISOString(), channel, domain: entry.domain }));
+
     const health: HealthStatus = {
+
+      auth,
 
       browser: {
 
@@ -168,6 +186,7 @@ export function setupHealthEndpoint(app: Express, deps: HealthDeps = defaultHeal
         limit: CONFIG.streaming.maxConcurrentStreams
       },
       timestamp: new Date(now).toISOString(),
+      tunes: { failed, succeeded: channelEntries.length - failed.length },
       uptime: process.uptime(),
       version: getPackageVersion()
     };

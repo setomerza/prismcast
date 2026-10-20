@@ -122,6 +122,10 @@ export type MediaContainer = "fmp4" | "ts";
  */
 export interface HealthStatus {
 
+  // Provider sign-in state by domain, as the channel table shows it: "verified" once a tune or a discovery proved access within the last week, "needsLogin" once a
+  // provider sign-in wall was confirmed. A domain with no evidence either way is absent. The ISO 8601 time is when that evidence was recorded.
+  auth: Record<string, { since: string; status: "needsLogin" | "verified" }>;
+
   // Browser connection information.
   browser: {
 
@@ -190,6 +194,13 @@ export interface HealthStatus {
 
   // ISO 8601 timestamp when the health check was performed.
   timestamp: string;
+
+  // The outcome of each channel's last tune within the last week: the channels whose last tune failed, sorted by channel key, and how many succeeded.
+  tunes: {
+
+    failed: { at: string; channel: string; domain: string }[];
+    succeeded: number;
+  };
 
   // Server uptime in seconds since the process started.
   uptime: number;

@@ -779,7 +779,7 @@ export function generateApiReferenceContent(): string {
     "<tr><th style=\"width: 35%;\">Endpoint</th><th>Description</th></tr>",
     "<tr>",
     "<td class=\"endpoint\"><a href=\"/health\"><code>GET /health</code></a></td>",
-    "<td>Health check returning JSON with browser status, memory usage, stream counts, and configuration.</td>",
+    "<td>Health check returning JSON with browser status, memory usage, stream counts, configuration, provider sign-in state, and failed tunes.</td>",
     "</tr>",
     "<tr>",
     "<td class=\"endpoint\"><a href=\"/logs\"><code>GET /logs</code></a></td>",

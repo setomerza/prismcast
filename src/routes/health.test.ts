@@ -34,6 +34,7 @@ import { deriveHealthStatus, setupHealthEndpoint } from "./health.ts";
 import type { CaptureImpairment } from "../browser/index.ts";
 import type { Express } from "express";
 import type { HealthDeps } from "./health.ts";
+import type { HealthSnapshot } from "../config/health.ts";
 import type { Nullable } from "../types/index.ts";
 import type { Page } from "puppeteer-core";
 import type { StreamRegistryEntry } from "../streaming/registry.ts";
@@ -49,6 +50,7 @@ interface MockState {
   browserConnected: boolean;
   captureImpaired: boolean;
   chromeVersion: Nullable<string>;
+  healthSnapshot: HealthSnapshot;
   pageCount: number;
   pageError: Nullable<Error>;
   streamCount: number;
@@ -66,6 +68,7 @@ interface MockState {
 // source type also drifted.
 interface HealthBody {
 
+  auth: Record<string, { since: string; status: "needsLogin" | "verified" }>;
   browser: { captureImpaired: boolean; connected: boolean; pageCount: number };
   captureMode: string;
   chrome: Nullable<string>;
@@ -76,6 +79,7 @@ interface HealthBody {
   status: "degraded" | "healthy" | "unhealthy";
   streams: { active: number; limit: number };
   timestamp: string;
+  tunes: { failed: { at: string; channel: string; domain: string }[]; succeeded: number };
   uptime: number;
   version: string;
 }
@@ -129,6 +133,7 @@ function defaultMockState(): MockState {
     browserConnected: false,
     captureImpaired: false,
     chromeVersion: null,
+    healthSnapshot: { channels: {}, domains: {} },
     pageCount: 0,
     pageError: null,
     streamCount: 0,
@@ -163,6 +168,7 @@ const deps: HealthDeps = {
 
     return mockState.streamSummaries.get(streamId) ?? { clients: [], total: 0 };
   },
+  getHealthSnapshot: (): HealthSnapshot => mockState.healthSnapshot,
   getStreamCount: (): number => mockState.streamCount,
   getTotalSegmentMemory: (): number => mockState.totalSegmentMemory,
   isBrowserConnected: (): boolean => mockState.browserConnected
@@ -254,7 +260,8 @@ describe("setupHealthEndpoint - GET /health response shape", () => {
     const keys = Object.keys(body).sort();
 
     // Locks the surface area of the response. Adding a key here should be a deliberate change accompanied by a documentation update.
-    const expectedRequired = [ "browser", "captureMode", "chrome", "clients", "ffmpegAvailable", "memory", "status", "streams", "timestamp", "uptime", "version" ];
+    const expectedRequired = [ "auth", "browser", "captureMode", "chrome", "clients", "ffmpegAvailable", "memory", "status", "streams", "timestamp", "tunes", "uptime",
+      "version" ];
 
     for(const required of expectedRequired) {
 
@@ -617,5 +624,62 @@ describe("deriveHealthStatus - the pure decision core", () => {
     // status codes would see a browser crash reported as a 200.
     assert.deepEqual(deriveHealthStatus({ browserConnected: false, captureImpaired: true, streamUtilization: 0 }),
       { httpStatus: 503, message: "Browser is not connected.", status: "unhealthy" });
+  });
+});
+
+describe("setupHealthEndpoint - GET /health sign-in and tune summary", () => {
+
+  test("auth and tunes are empty when no channel has been tuned", async () => {
+
+    const res = await fetch(urlFor("/health"));
+    const body = await res.json() as HealthBody;
+
+    assert.deepEqual(body.auth, {});
+    assert.deepEqual(body.tunes, { failed: [], succeeded: 0 });
+  });
+
+  test("reports each domain's sign-in state and the channels whose last tune failed, sorted", async () => {
+
+    mockState.healthSnapshot = {
+
+      channels: {
+
+        espn: { domain: "dishanywhere.com", status: "success", timestamp: Date.UTC(2026, 9, 20, 12) },
+        nfl: { domain: "dishanywhere.com", status: "failed", timestamp: Date.UTC(2026, 9, 20, 13) },
+        tbs: { domain: "dishanywhere.com", status: "failed", timestamp: Date.UTC(2026, 9, 20, 11) }
+      },
+      domains: {
+
+        "abc.com": { status: "verified", timestamp: Date.UTC(2026, 9, 19) },
+        "dishanywhere.com": { status: "needsLogin", timestamp: Date.UTC(2026, 9, 20, 14) }
+      }
+    };
+
+    const res = await fetch(urlFor("/health"));
+    const body = await res.json() as HealthBody;
+
+    assert.deepEqual(Object.keys(body.auth), [ "abc.com", "dishanywhere.com" ]);
+    assert.deepEqual(body.auth["dishanywhere.com"], { since: "2026-10-20T14:00:00.000Z", status: "needsLogin" });
+    assert.deepEqual(body.tunes, {
+
+      failed: [
+        { at: "2026-10-20T13:00:00.000Z", channel: "nfl", domain: "dishanywhere.com" },
+        { at: "2026-10-20T11:00:00.000Z", channel: "tbs", domain: "dishanywhere.com" }
+      ],
+      succeeded: 1
+    });
+  });
+
+  test("sign-in and tune state does not change the health status", async () => {
+
+    mockState.browserConnected = true;
+    mockState.healthSnapshot = { channels: { nfl: { domain: "dishanywhere.com", status: "failed", timestamp: 0 } },
+      domains: { "dishanywhere.com": { status: "needsLogin", timestamp: 0 } } };
+
+    const res = await fetch(urlFor("/health"));
+    const body = await res.json() as HealthBody;
+
+    assert.equal(res.status, 200);
+    assert.equal(body.status, "healthy");
   });
 });
