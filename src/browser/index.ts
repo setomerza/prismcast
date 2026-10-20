@@ -320,6 +320,17 @@ const inFlightPageIds = new Set<string>();
 const ownWindowPages = new WeakSet<Page>();
 
 /**
+ * Marks a page as living in a window of its own, so it never carries a shared-window command and the visibility policy never minimizes its window through it. Set
+ * by creators of own-window pages outside this module - the FFmpeg encoder mode's capture windows - with nothing awaited between the page's creation and the
+ * mark, as createDiscoveryPage does.
+ * @param page - The page that owns its window.
+ */
+export function markOwnWindowPage(page: Page): void {
+
+  ownWindowPages.add(page);
+}
+
+/**
  * Reports whether a page may carry a CDP command aimed at the shared window: it exists, it is still open, and it does not live in a window of its own. The
  * parameter accepts the absent case so every caller narrows through this one test rather than guarding beside it.
  * @param page - The candidate page, which may be absent.

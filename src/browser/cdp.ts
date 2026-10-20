@@ -198,6 +198,23 @@ export async function readWindowPlacement(page: Page): Promise<Nullable<WindowPl
 }
 
 /**
+ * Moves and resizes the window a page belongs to, leaving its state alone. Used for the per-stream capture windows of the FFmpeg encoder mode
+ * (captureWindows.ts), each of which has to sit at its own fixed rectangle of the screen; the shared window is never moved through this.
+ * @param page - The page whose window is moved.
+ * @param frame - The window's new outer frame, in screen coordinates.
+ * @returns True when Chrome accepted the command, false when the page or its window could not be reached.
+ */
+export async function setWindowFrame(page: Page, frame: { height: number; left: number; top: number; width: number }): Promise<boolean> {
+
+  return (await withCDPSession(page, async (session, windowId): Promise<boolean> => {
+
+    await session.send("Browser.setWindowBounds", { bounds: frame, windowId });
+
+    return true;
+  })) ?? false;
+}
+
+/**
  * Minimizes the browser window, which keeps the desktop clear and the GPU idle while nothing is capturing. Only the window-visibility executor should call this:
  * the window has to stay on screen for as long as any capture stream is reading the compositor, and that decision belongs to decideWindowVisibility in
  * windowSync.ts.
