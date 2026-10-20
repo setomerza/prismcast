@@ -603,17 +603,25 @@ export function buildEncoderFFmpegArgs(options: EncoderFFmpegOptions): string[] 
   const platform = options.platform ?? process.platform;
   const aacEncoder = platform === "darwin" ? "aac_at" : "aac";
 
+  /* Both inputs are raw, so everything about them is stated here and there is nothing to probe. FFmpeg probes its inputs one after the other before it encodes
+   * anything, and with the default probe size the audio input alone would be read for about thirteen seconds while the video pipe went unread and backed up into
+   * the pump. A minimal probe and a deep per-input queue let both pipes flow from the first frame.
+   */
+  const rawInput = [ "-probesize", "32", "-analyzeduration", "0", "-thread_queue_size", "1024" ];
+
   const ffmpegArgs = [
     "-hide_banner",
     "-nostats",
     "-loglevel", "warning",
     // Raw yuv420p frames at a constant rate: the pump guarantees exactly frameRate frames per second of capture.
+    ...rawInput,
     "-f", "rawvideo",
     "-pix_fmt", "yuv420p",
     "-video_size", String(options.width) + "x" + String(options.height),
     "-framerate", String(options.frameRate),
     "-i", "pipe:0",
     // Continuous 48 kHz stereo float audio, aligned by the pump to the first video frame.
+    ...rawInput,
     "-f", "f32le",
     "-ar", "48000",
     "-ac", "2",
@@ -663,8 +671,19 @@ export function spawnEncoderFFmpeg(ffmpegBin: string, options: EncoderFFmpegOpti
 
   const ffmpeg = spawn(ffmpegBin, buildEncoderFFmpegArgs(options), { stdio: [ "pipe", "pipe", "pipe", "pipe" ] });
   const [ stdin, stdout, stderr, audioIn ] = ffmpeg.stdio as unknown as [ Writable, Readable, Readable, Writable ];
+  const supervision = superviseFFmpeg({ ffmpeg, label: "FFmpeg encoder", onError, stderr, streamId });
 
-  return { ...superviseFFmpeg({ ffmpeg, label: "FFmpeg encoder", onError, stderr, streamId }), audioIn, process: ffmpeg, stdin, stdout };
+  /* An FFmpeg blocked reading one of its input pipes does not act on SIGTERM until the read returns, so the kill also closes both inputs: the read returns end of
+   * input and FFmpeg exits. Without this, an encoder whose capture ended mid-read outlives its stream.
+   */
+  const kill = (): void => {
+
+    supervision.kill();
+    stdin.destroy();
+    audioIn.destroy();
+  };
+
+  return { audioIn, isShuttingDown: supervision.isShuttingDown, kill, process: ffmpeg, stdin, stdout };
 }
 
 /**

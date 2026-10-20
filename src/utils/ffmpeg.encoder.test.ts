@@ -52,6 +52,21 @@ describe("buildEncoderFFmpegArgs", () => {
     assert.equal(valueOf(args, "-ac"), "2");
   });
 
+  test("probes neither raw input, so neither pipe waits on the other before encoding starts", () => {
+
+    const args = buildEncoderFFmpegArgs(OPTIONS);
+    const videoFormat = args.indexOf("rawvideo");
+    const audioFormat = args.indexOf("f32le");
+
+    for(const [ input, formatIndex, from ] of [ [ "video", videoFormat, 0 ], [ "audio", audioFormat, videoFormat ] ] as const) {
+
+      assert.equal(valueOf(args, "-probesize", from), "32", input + " input has a minimal probe");
+      assert.equal(valueOf(args, "-analyzeduration", from), "0", input + " input is not analyzed");
+      assert.ok(args.indexOf("-probesize", from) < formatIndex, input + " input's probe options precede its format");
+      assert.equal(valueOf(args, "-thread_queue_size", from), "1024", input + " input has a deep queue");
+    }
+  });
+
   test("encodes with the chosen encoder and AAC, and writes the remux path's fragmented MP4 to stdout", () => {
 
     const args = buildEncoderFFmpegArgs(OPTIONS);
