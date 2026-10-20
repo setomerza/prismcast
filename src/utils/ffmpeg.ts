@@ -7,10 +7,13 @@
 import type { Readable, Writable } from "node:stream";
 import { createDefaultFFmpegContext, runFFmpegQuietly } from "./ffmpeg.context.ts";
 import type { ChildProcess } from "node:child_process";
+import type { Clock } from "homebridge-plugin-utils";
 import { LOG } from "./logger.ts";
+import type { Nullable } from "../types/index.ts";
 import { join } from "node:path";
 import { memoizeAsync } from "./memo.ts";
 import { spawn } from "node:child_process";
+import { systemClock } from "homebridge-plugin-utils";
 
 // FFmpeg stderr noise patterns that are suppressed from logging. The -nostats flag suppresses most progress output, but some FFmpeg builds or versions may still
 // emit these patterns. The filter acts as a safety net to keep logs clean.
@@ -304,9 +307,15 @@ function spawnFFmpegProcess({ args, ffmpegBin, label, onError, streamId }: {
   return { ...superviseFFmpeg({ ffmpeg, label, onError, stderr: ffmpeg.stderr, streamId }), process: ffmpeg, stdin: ffmpeg.stdin, stdout: ffmpeg.stdout };
 }
 
+// How long a killed FFmpeg gets to exit on SIGTERM before it is sent SIGKILL. FFmpeg acts on SIGTERM between reads and writes, so a child blocked on a pipe can
+// sit on it indefinitely; without the escalation each such child outlives its stream, and an encoder holds its GPU session the whole time.
+export const FFMPEG_KILL_GRACE_MS = 3000;
+
 /**
- * Attaches the shared lifecycle to a spawned FFmpeg: stderr logging with noise filtering, exit and error callbacks, and the graceful kill. Split out of
- * spawnFFmpegProcess so a spawn with a different stdio shape (the encoder's extra audio pipe) gets exactly the same supervision.
+ * Attaches the shared lifecycle to a spawned FFmpeg: stderr logging with noise filtering, exit and error callbacks, and the kill - SIGTERM, then SIGKILL when the
+ * child has not exited after FFMPEG_KILL_GRACE_MS. Split out of spawnFFmpegProcess so a spawn with a different stdio shape (the encoder's extra audio pipe) gets
+ * exactly the same supervision. Exported for its tests, which drive it with a child double on a virtual clock.
+ * @param options.clock - The time port the kill escalation is scheduled on. Defaults to the system clock.
  * @param options.ffmpeg - The spawned child.
  * @param options.label - Descriptive label for log messages and error strings.
  * @param options.onError - Callback invoked when FFmpeg exits unexpectedly or encounters an error.
@@ -314,7 +323,8 @@ function spawnFFmpegProcess({ args, ffmpegBin, label, onError, streamId }: {
  * @param options.streamId - Optional stream identifier for log prefixing.
  * @returns The teardown-requested read and the kill function.
  */
-function superviseFFmpeg({ ffmpeg, label, onError, stderr, streamId }: {
+export function superviseFFmpeg({ clock = systemClock, ffmpeg, label, onError, stderr, streamId }: {
+  clock?: Clock;
   ffmpeg: ChildProcess;
   label: string;
   onError: (error: Error) => void;
@@ -326,6 +336,18 @@ function superviseFFmpeg({ ffmpeg, label, onError, stderr, streamId }: {
 
   // Track whether graceful shutdown has been initiated. When true, we suppress error callbacks because any exit (whether from SIGTERM or stdin close) is expected.
   let shuttingDown = false;
+
+  // Whether the child has exited, whether a kill() has already signalled it, and the pending SIGKILL that kill armed, which the exit cancels.
+  let exited = false;
+  let signalled = false;
+  let escalation: Nullable<ReturnType<Clock["schedule"]>> = null;
+
+  ffmpeg.once("exit", () => {
+
+    exited = true;
+    escalation?.[Symbol.dispose]();
+    escalation = null;
+  });
 
   // Log FFmpeg stderr output (warnings and errors). Suppress noise patterns that are not actionable.
   stderr.on("data", (data: Buffer) => {
@@ -375,15 +397,34 @@ function superviseFFmpeg({ ffmpeg, label, onError, stderr, streamId }: {
     onError(error);
   });
 
-  // Kill function for graceful shutdown. Sets the shuttingDown flag before sending SIGTERM so that any exit is treated as normal termination.
+  // Kill function for graceful shutdown. Sets the shuttingDown flag before sending SIGTERM so that any exit is treated as normal termination, then arms the SIGKILL
+  // that a child still running after the grace period receives. Calling it again neither resends SIGTERM nor re-arms the escalation.
   const kill = (): void => {
 
     shuttingDown = true;
+
+    if(exited || signalled) {
+
+      return;
+    }
+
+    signalled = true;
 
     if(!ffmpeg.killed) {
 
       ffmpeg.kill("SIGTERM");
     }
+
+    escalation = clock.schedule((): void => {
+
+      escalation = null;
+
+      if(!exited) {
+
+        LOG.debug("streaming:ffmpeg", "%s%s did not exit on SIGTERM within %dms; sending SIGKILL.", logPrefix, label, FFMPEG_KILL_GRACE_MS);
+        ffmpeg.kill("SIGKILL");
+      }
+    }, FFMPEG_KILL_GRACE_MS);
   };
 
   return { isShuttingDown: (): boolean => shuttingDown, kill };
@@ -546,11 +587,36 @@ export interface EncoderFFmpegOptions {
   readonly frameRate: number;
   readonly height: number;
 
+  // When set, the video is grabbed from this region of the X display rather than read as raw frames from stdin. width and height above must match it.
+  readonly grab?: X11GrabRegion;
+
   // Frames between keyframes. The segmenter cuts at keyframes, so this is the segment duration in frames.
   readonly keyframeInterval: number;
   readonly platform?: NodeJS.Platform;
   readonly videoBitrate: number;
   readonly width: number;
+}
+
+/**
+ * A rectangle of an X display for FFmpeg's x11grab input: the display name (":99" in the container) and the region's origin in screen coordinates.
+ */
+export interface X11GrabRegion {
+
+  readonly display: string;
+  readonly x: number;
+  readonly y: number;
+}
+
+/**
+ * Builds the x11grab input specifier: the display with its screen number, then the region's origin, as "display.screen+x,y".
+ * @param region - The display and origin.
+ * @returns The specifier.
+ */
+export function x11GrabInput(region: X11GrabRegion): string {
+
+  const display = /\.\d+$/.test(region.display) ? region.display : region.display + ".0";
+
+  return display + "+" + String(region.x) + "," + String(region.y);
 }
 
 /**
@@ -609,18 +675,21 @@ export function buildEncoderFFmpegArgs(options: EncoderFFmpegOptions): string[] 
    */
   const rawInput = [ "-probesize", "32", "-analyzeduration", "0", "-thread_queue_size", "1024" ];
 
+  const videoSize = String(options.width) + "x" + String(options.height);
+
+  // The video input: the stream's region of the X display, grabbed at the frame rate without the pointer, or raw yuv420p frames on stdin that the pump paces to
+  // exactly frameRate per second.
+  const videoInput = options.grab ?
+    [ "-thread_queue_size", "1024", "-f", "x11grab", "-draw_mouse", "0", "-framerate", String(options.frameRate), "-video_size", videoSize, "-i",
+      x11GrabInput(options.grab) ] :
+    [ ...rawInput, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-video_size", videoSize, "-framerate", String(options.frameRate), "-i", "pipe:0" ];
+
   const ffmpegArgs = [
     "-hide_banner",
     "-nostats",
     "-loglevel", "warning",
-    // Raw yuv420p frames at a constant rate: the pump guarantees exactly frameRate frames per second of capture.
-    ...rawInput,
-    "-f", "rawvideo",
-    "-pix_fmt", "yuv420p",
-    "-video_size", String(options.width) + "x" + String(options.height),
-    "-framerate", String(options.frameRate),
-    "-i", "pipe:0",
-    // Continuous 48 kHz stereo float audio, aligned by the pump to the first video frame.
+    ...videoInput,
+    // Continuous 48 kHz stereo float audio, aligned by the pump to the video.
     ...rawInput,
     "-f", "f32le",
     "-ar", "48000",
@@ -673,14 +742,15 @@ export function spawnEncoderFFmpeg(ffmpegBin: string, options: EncoderFFmpegOpti
   const [ stdin, stdout, stderr, audioIn ] = ffmpeg.stdio as unknown as [ Writable, Readable, Readable, Writable ];
   const supervision = superviseFFmpeg({ ffmpeg, label: "FFmpeg encoder", onError, stderr, streamId });
 
-  /* An FFmpeg blocked reading one of its input pipes does not act on SIGTERM until the read returns, so the kill also closes both inputs: the read returns end of
-   * input and FFmpeg exits. Without this, an encoder whose capture ended mid-read outlives its stream.
+  /* An FFmpeg blocked on one of its pipes does not act on SIGTERM until the read or write returns, so the kill also closes all three: a blocked read returns end of
+   * input, a blocked write to a stdout nobody drains any more fails, and FFmpeg exits. The supervision's SIGKILL covers anything that still holds on.
    */
   const kill = (): void => {
 
     supervision.kill();
     stdin.destroy();
     audioIn.destroy();
+    stdout.destroy();
   };
 
   return { audioIn, isShuttingDown: supervision.isShuttingDown, kill, process: ffmpeg, stdin, stdout };

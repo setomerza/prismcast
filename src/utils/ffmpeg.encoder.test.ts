@@ -3,7 +3,7 @@
  * ffmpeg.encoder.test.ts: Tests for the FFmpeg encoder mode's pure pieces: the argv builders, the encoder check, and the search for an FFmpeg that can actually
  * encode. The search runs over a context literal, so no FFmpeg is spawned.
  */
-import { buildEncoderFFmpegArgs, buildEncoderProbeArgs, buildVideoEncoderArgs, isFFmpegVideoEncoder, probeEncoderFFmpegPath } from "./ffmpeg.ts";
+import { buildEncoderFFmpegArgs, buildEncoderProbeArgs, buildVideoEncoderArgs, isFFmpegVideoEncoder, probeEncoderFFmpegPath, x11GrabInput } from "./ffmpeg.ts";
 import { describe, test } from "node:test";
 import type { EncoderFFmpegOptions } from "./ffmpeg.ts";
 import assert from "node:assert/strict";
@@ -88,6 +88,32 @@ describe("buildEncoderFFmpegArgs", () => {
     assert.equal(valueOf(args, "-metadata"), "comment=PrismCast - ESPN");
     assert.equal(valueOf(args, "-c:a"), "aac_at");
     assert.equal(args.at(-1), "pipe:1");
+  });
+});
+
+describe("buildEncoderFFmpegArgs with a grab region", () => {
+
+  test("grabs the region of the X display at the frame rate without the pointer, and still reads audio from fd 3", () => {
+
+    const args = buildEncoderFFmpegArgs({ ...OPTIONS, grab: { display: ":99", x: 1280, y: 720 } });
+    const grabInput = args.indexOf(":99.0+1280,720");
+
+    assert.ok(grabInput > 0, "the region is the first input");
+    assert.equal(valueOf(args, "-f"), "x11grab");
+    assert.equal(valueOf(args, "-draw_mouse"), "0");
+    assert.equal(valueOf(args, "-framerate"), "30");
+    assert.equal(valueOf(args, "-video_size"), "1280x720");
+    assert.ok(!args.includes("pipe:0"), "nothing is read from stdin");
+    assert.ok(!args.includes("rawvideo"), "no raw video input");
+    assert.ok(args.indexOf("pipe:3") > grabInput, "the audio is the second input");
+    assert.equal(valueOf(args, "-c:v"), "h264_nvenc");
+    assert.equal(args.at(-1), "pipe:1");
+  });
+
+  test("names the screen for a bare display and keeps one that already has it", () => {
+
+    assert.equal(x11GrabInput({ display: ":99", x: 0, y: 0 }), ":99.0+0,0");
+    assert.equal(x11GrabInput({ display: ":1.2", x: 5, y: 7 }), ":1.2+5,7");
   });
 });
 
