@@ -700,6 +700,11 @@ export function buildEncoderFFmpegArgs(options: EncoderFFmpegOptions): string[] 
     "-map", "0:v",
     "-map", "1:a",
     ...buildVideoEncoderArgs(options.encoder, options.videoBitrate, options.keyframeInterval),
+    /* The MP4 output takes the encoder's SPS and PPS as global headers, so by default they appear only in the init segment. The preroll ahead of a slow tune is
+     * Constrained Baseline under its own init, and an FFmpeg-based HLS client that remuxes across that discontinuity keeps the preroll's parameter sets and
+     * mis-decodes every High-profile frame after it. Repeating them in-band on each keyframe lets any client resync at the first keyframe past the boundary.
+     */
+    "-bsf:v", "dump_extra=freq=keyframe",
     "-c:a", aacEncoder,
     "-b:a", String(options.audioBitrate),
     "-f", "mp4",

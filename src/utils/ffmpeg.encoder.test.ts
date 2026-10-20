@@ -74,6 +74,7 @@ describe("buildEncoderFFmpegArgs", () => {
     assert.equal(valueOf(args, "-c:v"), "h264_nvenc");
     assert.equal(valueOf(args, "-b:v"), "8000000");
     assert.equal(valueOf(args, "-g"), "60", "keyframes at the given interval");
+    assert.equal(valueOf(args, "-bsf:v"), "dump_extra=freq=keyframe", "parameter sets repeat in-band on every keyframe");
     assert.equal(valueOf(args, "-c:a"), "aac");
     assert.equal(valueOf(args, "-b:a"), "256000");
     assert.equal(valueOf(args, "-movflags"), "frag_keyframe+empty_moov+default_base_moof+skip_sidx+skip_trailer");
