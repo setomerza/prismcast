@@ -14,7 +14,7 @@ import { ACTIVE_TAB_GRANT_CEILING_MS, ACTIVE_TAB_GRANT_POLL_MS, CAPTURE_FRAME_SI
   EXTENSION_READY_EXPRESSION, acquireCaptureStream } from "./tabCapture.ts";
 import type { Browser, Page } from "puppeteer-core";
 import type { CaptureStreamOptions, ExtensionRecordingSettings, TabCaptureDeps } from "./tabCapture.ts";
-import { RAW_CAPTURE_MAX_BUFFERED_BYTES, RAW_HEADER_SIZE, RAW_KIND_AUDIO, RAW_KIND_VIDEO, RAW_PIXEL_FORMATS } from "./rawCapture.ts";
+import { RAW_CAPTURE_MAX_BUFFERED_BYTES, RAW_HEADER_SIZE, RAW_KIND_AUDIO } from "./rawCapture.ts";
 import type { SelectedTab, WithTabSelectedContext } from "./tabSelection.ts";
 import { TestClock, advanceThroughSchedule, drainClock, settle } from "homebridge-plugin-utils/testing";
 import type { WebSocket, WebSocketServer } from "ws";
@@ -504,15 +504,11 @@ describe("acquireCaptureStream", () => {
 
     assert.deepEqual(start?.arg, {
 
-      audio: true,
-      formatCodes: RAW_PIXEL_FORMATS,
+      audioKind: RAW_KIND_AUDIO,
       headerSize: RAW_HEADER_SIZE,
       index: (start?.arg as RawRecordingSettings).index,
-      kinds: { audio: RAW_KIND_AUDIO, video: RAW_KIND_VIDEO },
-      maxBufferedBytes: RAW_CAPTURE_MAX_BUFFERED_BYTES,
-      video: true,
-      videoConstraints: OPTIONS.videoConstraints
-    }, "the raw settings carry the capture's shape and the framing constants");
+      maxBufferedBytes: RAW_CAPTURE_MAX_BUFFERED_BYTES
+    }, "the raw settings carry the capture's index and the framing constants, and nothing about video");
   });
 
   test("stop() on a raw capture asks stopRawRecording, once, for its own index", async () => {

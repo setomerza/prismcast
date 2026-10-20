@@ -315,7 +315,8 @@ The container accepts environment variables for both the virtual display and Pri
 | `VIDEO_BITRATE` | 12000000 | Video bitrate in bps |
 | `AUDIO_BITRATE` | 256000 | Audio bitrate in bps |
 | `FRAME_RATE` | 60 | Target frame rate |
-| `VIDEO_ENCODER` | browser | Who encodes video: `browser` (Chrome) or `ffmpeg` (raw frames encoded by FFmpeg, for GPUs Chrome cannot encode with) |
+| `VIDEO_ENCODER` | browser | Who encodes video: `browser` (Chrome) or `ffmpeg` (FFmpeg grabs each stream's own window off the screen with x11grab and encodes it, for GPUs Chrome cannot encode with, such as NVIDIA on Linux; audio still comes from the tab capture) |
+| `SCREEN_WIDTH` / `SCREEN_HEIGHT` | 1920 / 1080 | Virtual screen size. With `VIDEO_ENCODER=ffmpeg` each stream needs its own window, so size the screen to hold one capture window per stream plus one (e.g. 3968x2640 holds eight at 720p) |
 | `FFMPEG_VIDEO_ENCODER` | h264_nvenc | FFmpeg encoder when `VIDEO_ENCODER=ffmpeg`: `h264_nvenc` (NVIDIA) or `libx264` (software) |
 | `PRISMCAST_FFMPEG_PATH` | (auto) | FFmpeg to try first for `VIDEO_ENCODER=ffmpeg`; the first FFmpeg that can actually encode with the chosen encoder is used |
 | `HDHR_ENABLED` | true | Enable HDHomeRun emulation for Plex |

@@ -1,27 +1,25 @@
 /* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * rawPump.ts: Paces raw capture messages into the two input pipes of an FFmpeg that encodes them.
+ * rawPump.ts: Paces the raw audio recorder's messages into the audio pipe of an FFmpeg that grabs its video from the screen.
  *
- * The raw recorder (browser/rawCapture.ts) sends each video frame and each block of audio as it arrives, stamped with Chrome's capture clock. FFmpeg reading raw
- * video and raw audio from pipes has no timestamps at all: it counts frames and samples. So the pump's job is to turn timestamped, irregular arrivals into two
- * perfectly regular streams that start together:
+ * In the FFmpeg encoder mode FFmpeg reads two inputs: its x11grab of the stream's window, which it stamps with the wall clock from the moment it starts, and 48 kHz
+ * stereo 32-bit float PCM on a pipe, which carries no timestamps at all - FFmpeg simply counts samples. The raw recorder (browser/rawCapture.ts) sends audio
+ * blocks as Chrome captures them, stamped with the track's own capture clock. So the pump's job is to turn timestamped, irregular arrivals into one continuous
+ * stream whose sample count stays level with the wall clock FFmpeg's video runs on:
  *
- * - Video becomes exactly frameRate frames per second of yuv420p at the stream's size. A frame lands in the output slot its timestamp names, measured from the
- *   first frame's; a slot no frame reached is filled by repeating the previous frame, and a frame that arrives for a slot already written is not written (it still
- *   becomes the frame the next repeat uses). A jump of more than RAW_MAX_GAP_US either way - a stall, or the track's clock restarting - re-anchors the track so
- *   the frame takes the next slot, rather than filling seconds of repeats.
- * - Audio becomes continuous 48 kHz stereo 32-bit float. A block lands at the sample its timestamp names, measured from an anchor; a small disagreement is absorbed
- *   as jitter, a gap is filled with silence, and an overlap is trimmed.
+ * - The first block is anchored where the wall clock stands when it arrives, measured from the encoder's start, and preceded by that much silence.
+ * - Each later block lands at the sample its own timestamp names relative to that anchor. A disagreement with what has been written up to the tolerance is
+ *   absorbed as jitter; a larger gap is filled with silence and a larger overlap is trimmed.
+ * - When a block's place by its own clock and the wall clock's place for it drift apart by more than the drift limit - the tab stalled, the track's clock
+ *   restarted, or its rate has drifted against the system's over a long stream - the block is re-anchored to the wall clock.
  *
- * Chrome does not promise that a capture's audio and video timestamps share a time base, so neither track's timestamps are compared with the other's. Instead the
- * audio is anchored to the video's output position: its first block lands where the video output stands at that moment, and a block that disagrees with its
- * anchor by more than RAW_MAX_GAP_US is re-anchored the same way. Both tracks are live and processed as they arrive, so the video's output position at any moment
- * is the elapsed capture time, and the two pipes start and stay in step. Audio that arrives before the first frame has nothing to anchor to and is dropped.
+ * Chrome does not promise that a capture's audio timestamps share a time base with anything else, which is why only differences between them are ever used.
  */
-import { RAW_HEADER_SIZE, RAW_KIND_AUDIO, RAW_KIND_VIDEO, RAW_PIXEL_FORMATS } from "../browser/rawCapture.ts";
-import { LOG } from "../utils/index.ts";
+import { RAW_HEADER_SIZE, RAW_KIND_AUDIO } from "../browser/rawCapture.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import { Writable } from "node:stream";
+import { systemClock } from "homebridge-plugin-utils";
 
 // Constants.
 
@@ -29,38 +27,24 @@ import { Writable } from "node:stream";
 export const RAW_AUDIO_SAMPLE_RATE = 48000;
 export const RAW_AUDIO_CHANNELS = 2;
 
-// Capture timestamps are in microseconds.
-const MICROSECONDS_PER_SECOND = 1000000;
-
-// A timestamp jump longer than this is a stall or a clock restart rather than jitter: the track re-anchors instead of the gap being filled.
-export const RAW_MAX_GAP_US = 2000000;
-
-// The audio disagreement absorbed as jitter rather than corrected, in samples: 20ms.
+// The disagreement between a block's place and what has been written that is absorbed as jitter rather than corrected, in samples: 20ms.
 export const RAW_AUDIO_TOLERANCE_SAMPLES = 960;
 
-// How much unwritten video the pump lets the FFmpeg pipe hold before it declares the encoder too slow and fails the stream. About three seconds of 720p.
-export const RAW_PUMP_MAX_BUFFERED_BYTES = 128 * 1024 * 1024;
+// The disagreement between a block's own clock and the wall clock past which the block is re-anchored to the wall clock, in samples: 60ms. Arrival jitter alone
+// stays well inside it, so it only fires for a stall, a clock restart, or drift that has built up.
+export const RAW_AUDIO_DRIFT_LIMIT_SAMPLES = 2880;
 
-// The largest message the parser accepts. A 4K RGBA frame is about 33MB, so anything larger is broken framing.
-const RAW_MAX_MESSAGE_SIZE = 64 * 1024 * 1024;
+// How much unwritten audio the pump lets FFmpeg's pipe hold before it declares the encoder stalled and fails the stream. About ten seconds of audio.
+export const RAW_PUMP_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 
-// The format names by header code.
-const FORMAT_NAMES: ReadonlyMap<number, string> = new Map(Object.entries(RAW_PIXEL_FORMATS).map(([ name, code ]) => [ code, name ]));
+// Timestamps are in microseconds and the clock reads milliseconds.
+const MICROSECONDS_PER_SECOND = 1000000;
+const MICROSECONDS_PER_MILLISECOND = 1000;
+
+// The largest message the parser accepts. Chrome hands audio over in blocks of a few hundred frames, so anything near this is broken framing.
+const RAW_MAX_MESSAGE_SIZE = 4 * 1024 * 1024;
 
 // Types.
-
-/**
- * One raw video frame as the recorder sent it.
- */
-export interface RawVideoMessage {
-
-  readonly data: Buffer;
-  readonly format: string;
-  readonly height: number;
-  readonly kind: "video";
-  readonly timestamp: number;
-  readonly width: number;
-}
 
 /**
  * One block of raw audio as the recorder sent it: planar 32-bit float, one plane per channel.
@@ -70,12 +54,9 @@ export interface RawAudioMessage {
   readonly channels: number;
   readonly data: Buffer;
   readonly frames: number;
-  readonly kind: "audio";
   readonly sampleRate: number;
   readonly timestamp: number;
 }
-
-export type RawMessage = RawAudioMessage | RawVideoMessage;
 
 /**
  * Streaming parser for the recorder's self-delimiting messages.
@@ -87,48 +68,27 @@ export interface RawMessageParser {
 }
 
 /**
- * What the video pacer publishes for the audio pacer to anchor to: the output time, in microseconds, at which the latest written frame starts, or null before the
- * first frame.
- */
-export interface RawTimeline {
-
-  videoPositionUs: Nullable<number>;
-}
-
-/**
- * Where one video frame goes: how many times to repeat the previous frame first, and whether this frame itself is written.
- */
-export interface VideoPlacement {
-
-  readonly emit: boolean;
-  readonly repeats: number;
-}
-
-/**
  * The counts a pump keeps for its stream's diagnostics.
  */
 export interface RawPumpStats {
 
-  audioSamplesPadded: number;
-  audioSamplesTrimmed: number;
-  framesDropped: number;
-  framesRejected: number;
-  framesRepeated: number;
-  framesWritten: number;
-  stalls: number;
+  blocksWritten: number;
+  reanchors: number;
+  samplesPadded: number;
+  samplesTrimmed: number;
 }
 
 /**
- * What a pump is built with: the output geometry and rate FFmpeg was told to expect, and the two pipes to write.
+ * What a pump is built with: the pipe to write, and when the encoder it feeds started, by the clock the pump paces against.
  */
 export interface RawPumpOptions {
 
   readonly audioOut: Writable;
-  readonly frameRate: number;
-  readonly height: number;
+  readonly clock?: Clock;
   readonly maxBufferedBytes?: number;
-  readonly videoOut: Writable;
-  readonly width: number;
+
+  // The clock's reading, in milliseconds, when the encoder FFmpeg was spawned: the moment its grabbed video's timeline starts.
+  readonly startedAt: number;
 }
 
 /**
@@ -144,10 +104,10 @@ export interface RawPump extends Writable {
 /**
  * Creates a parser for the raw capture stream. The stream is the recorder's messages concatenated, possibly split across chunks, so the parser buffers until a
  * whole message is present, then emits it.
- * @param onMessage - Invoked for each complete message. Messages of an unknown kind are skipped.
+ * @param onAudio - Invoked for each complete audio message. Messages of any other kind are skipped.
  * @returns The parser.
  */
-export function createRawMessageParser(onMessage: (message: RawMessage) => void): RawMessageParser {
+export function createRawMessageParser(onAudio: (message: RawAudioMessage) => void): RawMessageParser {
 
   let buffer: Buffer = Buffer.alloc(0);
 
@@ -172,201 +132,21 @@ export function createRawMessageParser(onMessage: (message: RawMessage) => void)
         }
 
         const kind = buffer.readUInt8(4);
-        const detail = buffer.readUInt8(5);
-        const timestamp = buffer.readDoubleLE(8);
-        const first = buffer.readUInt32LE(16);
-        const second = buffer.readUInt32LE(20);
-        const data = buffer.subarray(RAW_HEADER_SIZE, length);
+        const message = { channels: buffer.readUInt8(5), data: buffer.subarray(RAW_HEADER_SIZE, length), frames: buffer.readUInt32LE(20),
+          sampleRate: buffer.readUInt32LE(16), timestamp: buffer.readDoubleLE(8) };
 
         buffer = buffer.subarray(length);
 
-        if(kind === RAW_KIND_VIDEO) {
+        if(kind === RAW_KIND_AUDIO) {
 
-          onMessage({ data, format: FORMAT_NAMES.get(detail) ?? "unknown", height: second, kind: "video", timestamp, width: first });
-        } else if(kind === RAW_KIND_AUDIO) {
-
-          onMessage({ channels: detail, data, frames: second, kind: "audio", sampleRate: first, timestamp });
+          onAudio(message);
         }
       }
     }
   };
 }
 
-// Video.
-
-/**
- * Converts a raw frame to packed yuv420p at its own size, the one layout the encoder's pipe takes. I420 passes through; NV12's interleaved chroma is split; the
- * RGB formats are converted with BT.709 limited-range coefficients, which is what HD video decoders assume. Odd sizes are not supported, since 4:2:0 needs even
- * ones and every capture preset is even.
- * @param frame - The frame as the recorder sent it.
- * @returns The yuv420p frame, or null for a format or size it cannot convert.
- */
-export function toI420(frame: RawVideoMessage): Nullable<Buffer> {
-
-  const { data, height, width } = frame;
-  const lumaSize = width * height;
-  const chromaSize = lumaSize / 4;
-  const frameSize = lumaSize + (2 * chromaSize);
-
-  if(((width % 2) !== 0) || ((height % 2) !== 0)) {
-
-    return null;
-  }
-
-  switch(frame.format) {
-
-    case "I420":
-    case "I420A":
-
-      return (data.length >= frameSize) ? data.subarray(0, frameSize) : null;
-
-    case "NV12": {
-
-      if(data.length < frameSize) {
-
-        return null;
-      }
-
-      const out = Buffer.allocUnsafe(frameSize);
-
-      data.copy(out, 0, 0, lumaSize);
-
-      for(let i = 0; i < chromaSize; i++) {
-
-        out[lumaSize + i] = (data[lumaSize + (2 * i)] ?? 0);
-        out[lumaSize + chromaSize + i] = (data[lumaSize + (2 * i) + 1] ?? 0);
-      }
-
-      return out;
-    }
-
-    case "BGRA":
-    case "BGRX":
-    case "RGBA":
-    case "RGBX":
-
-      return (data.length >= (lumaSize * 4)) ? rgbToI420(data, width, height, frame.format.startsWith("B")) : null;
-
-    default:
-
-      return null;
-  }
-}
-
-/**
- * BT.709 limited-range RGB to yuv420p, chroma from the 2x2 average.
- * @param data - Four bytes per pixel.
- * @param width - Frame width, even.
- * @param height - Frame height, even.
- * @param bgr - True when the byte order is B, G, R.
- * @returns The yuv420p frame.
- */
-function rgbToI420(data: Buffer, width: number, height: number, bgr: boolean): Buffer {
-
-  const lumaSize = width * height;
-  const chromaWidth = width / 2;
-  const out = Buffer.allocUnsafe(lumaSize + (lumaSize / 2));
-  const rOffset = bgr ? 2 : 0;
-  const bOffset = bgr ? 0 : 2;
-
-  for(let y = 0; y < height; y += 2) {
-
-    for(let x = 0; x < width; x += 2) {
-
-      let rSum = 0;
-      let gSum = 0;
-      let bSum = 0;
-
-      for(let dy = 0; dy < 2; dy++) {
-
-        for(let dx = 0; dx < 2; dx++) {
-
-          const pixel = (((y + dy) * width) + x + dx) * 4;
-          const r = (data[pixel + rOffset] ?? 0);
-          const g = (data[pixel + 1] ?? 0);
-          const b = (data[pixel + bOffset] ?? 0);
-
-          // Y' = 16 + 219 * (0.2126 R + 0.7152 G + 0.0722 B) / 255, in 8.8 fixed point.
-          out[((y + dy) * width) + x + dx] = 16 + (((47 * r) + (157 * g) + (16 * b)) >> 8);
-          rSum += r;
-          gSum += g;
-          bSum += b;
-        }
-      }
-
-      const chroma = ((y / 2) * chromaWidth) + (x / 2);
-
-      // Cb and Cr from the averaged pixel, 8.8 fixed point; the sums are of four pixels, hence the extra two bits of shift. Each row of coefficients sums to zero so
-      // grays stay exactly neutral.
-      out[lumaSize + chroma] = 128 + (((-26 * rSum) - (86 * gSum) + (112 * bSum)) >> 10);
-      out[lumaSize + (lumaSize / 4) + chroma] = 128 + (((112 * rSum) - (102 * gSum) - (10 * bSum)) >> 10);
-    }
-  }
-
-  return out;
-}
-
-/**
- * Creates the video pacer: the decision of which output slot each frame fills.
- * @param timeline - Where the pacer publishes its output position for the audio pacer.
- * @param frameRate - The output frame rate.
- * @param onStall - Invoked when a jump re-anchored the track.
- * @returns The placement function, given a frame's capture timestamp in microseconds.
- */
-export function createVideoPacer(timeline: RawTimeline, frameRate: number, onStall: () => void = (): void => { /* No stall observer. */ }):
-(timestampUs: number) => VideoPlacement {
-
-  const intervalUs = MICROSECONDS_PER_SECOND / frameRate;
-  const maxGapSlots = Math.ceil(RAW_MAX_GAP_US / intervalUs);
-  let originUs: Nullable<number> = null;
-  let written = 0;
-
-  const place = (timestampUs: number): VideoPlacement => {
-
-    // The first frame, or a frame after a jump: the track is anchored so this frame takes the next slot.
-    if(originUs === null) {
-
-      originUs = timestampUs - (written * intervalUs);
-      written++;
-
-      return { emit: true, repeats: 0 };
-    }
-
-    const slot = Math.round((timestampUs - originUs) / intervalUs);
-
-    if(Math.abs(slot - written) > maxGapSlots) {
-
-      originUs = null;
-      onStall();
-
-      return place(timestampUs);
-    }
-
-    // A frame for a slot already written: its content waits for the next repeat.
-    if(slot < written) {
-
-      return { emit: false, repeats: 0 };
-    }
-
-    const repeats = slot - written;
-
-    written = slot + 1;
-
-    return { emit: true, repeats };
-  };
-
-  return (timestampUs: number): VideoPlacement => {
-
-    const placement = place(timestampUs);
-
-    // The output time at which the latest frame starts: the moment of capture the newest arrivals correspond to.
-    timeline.videoPositionUs = (written - 1) * intervalUs;
-
-    return placement;
-  };
-}
-
-// Audio.
+// Conversion.
 
 /**
  * Converts a raw audio block to interleaved stereo at the output rate. Mono is duplicated to both channels, channels past the second are dropped, and a block at
@@ -413,39 +193,34 @@ export function toStereoOutput(block: RawAudioMessage): Float32Array {
   return out;
 }
 
+// Pacing.
+
 /**
  * Creates the audio pacer: the decision of where each block lands in the audio output.
- * @param timeline - The video pacer's published output position, which the audio anchors to.
+ * @param elapsedUs - Reads how long the encoder has been running, in microseconds of wall clock: where the grabbed video's timeline stands.
  * @param onAdjust - Invoked with the silence padded (positive) or samples trimmed (negative) for a block.
+ * @param onReanchor - Invoked when a block is re-anchored to the wall clock.
  * @returns The placement function, given a block's capture timestamp and its interleaved stereo samples; it returns what to write, which may be empty.
  */
-export function createAudioPacer(timeline: RawTimeline, onAdjust: (frames: number) => void = (): void => { /* No adjustment observer. */ }):
-(timestampUs: number, samples: Float32Array) => Float32Array {
+export function createAudioPacer(elapsedUs: () => number, onAdjust: (frames: number) => void = (): void => { /* No adjustment observer. */ },
+  onReanchor: () => void = (): void => { /* No re-anchor observer. */ }): (timestampUs: number, samples: Float32Array) => Float32Array {
 
-  const maxGapSamples = Math.round(RAW_MAX_GAP_US * RAW_AUDIO_SAMPLE_RATE / MICROSECONDS_PER_SECOND);
   let anchor: Nullable<{ sample: number; timestampUs: number }> = null;
   let written = 0;
 
-  // The output sample the video has reached, which is where an anchored block lands.
-  const videoSample = (): number => Math.round((timeline.videoPositionUs ?? 0) * RAW_AUDIO_SAMPLE_RATE / MICROSECONDS_PER_SECOND);
-
   return (timestampUs: number, samples: Float32Array): Float32Array => {
 
-    // Audio ahead of the first video frame has nothing to anchor to.
-    if(timeline.videoPositionUs === null) {
+    const wallSample = Math.round(elapsedUs() * RAW_AUDIO_SAMPLE_RATE / MICROSECONDS_PER_SECOND);
 
-      return new Float32Array(0);
-    }
-
-    anchor ??= { sample: videoSample(), timestampUs };
+    anchor ??= { sample: wallSample, timestampUs };
 
     let target = anchor.sample + Math.round((timestampUs - anchor.timestampUs) * RAW_AUDIO_SAMPLE_RATE / MICROSECONDS_PER_SECOND);
 
-    // A block that disagrees with its anchor by more than the gap limit - a stall, or the track's clock restarting - is re-anchored to the video's position.
-    if(Math.abs(target - written) > maxGapSamples) {
+    if(Math.abs(target - wallSample) > RAW_AUDIO_DRIFT_LIMIT_SAMPLES) {
 
-      anchor = { sample: videoSample(), timestampUs };
-      target = anchor.sample;
+      anchor = { sample: wallSample, timestampUs };
+      target = wallSample;
+      onReanchor();
     }
 
     const frames = samples.length / RAW_AUDIO_CHANNELS;
@@ -482,114 +257,35 @@ export function createAudioPacer(timeline: RawTimeline, onAdjust: (frames: numbe
 // The pump.
 
 /**
- * Creates a pump. Pipe the raw capture stream into it; it writes yuv420p frames to videoOut and f32le stereo 48 kHz audio to audioOut, and ends both when the
- * capture stream ends. The input never waits on the outputs, because the capture is live: when the encoder falls so far behind that the video pipe holds more
- * than maxBufferedBytes, the pump fails with an error instead, which the stream's recovery treats like any other capture failure.
- * @param options - The output geometry, rate, and pipes.
+ * Creates a pump. Pipe the raw capture stream into it; it writes f32le stereo 48 kHz audio to audioOut, level with the wall clock since startedAt, and ends the
+ * pipe when the capture stream ends. The input never waits on the output, because the capture is live: when the encoder stops reading so long that the pipe
+ * holds more than maxBufferedBytes, the pump fails with an error instead, which the stream's recovery treats like any other capture failure.
+ * @param options - The pipe, the clock, and the encoder's start.
  * @returns The pump.
  */
 export function createRawPump(options: RawPumpOptions): RawPump {
 
-  const { audioOut, frameRate, height, maxBufferedBytes = RAW_PUMP_MAX_BUFFERED_BYTES, videoOut, width } = options;
-  const stats: RawPumpStats = { audioSamplesPadded: 0, audioSamplesTrimmed: 0, framesDropped: 0, framesRejected: 0, framesRepeated: 0, framesWritten: 0, stalls: 0 };
-  const timeline: RawTimeline = { videoPositionUs: null };
-  const placeVideo = createVideoPacer(timeline, frameRate, () => { stats.stalls++; });
-  const placeAudio = createAudioPacer(timeline, (frames) => {
+  const { audioOut, clock = systemClock, maxBufferedBytes = RAW_PUMP_MAX_BUFFERED_BYTES, startedAt } = options;
+  const stats: RawPumpStats = { blocksWritten: 0, reanchors: 0, samplesPadded: 0, samplesTrimmed: 0 };
+  const place = createAudioPacer(() => (clock.now() - startedAt) * MICROSECONDS_PER_MILLISECOND, (frames) => {
 
     if(frames > 0) {
 
-      stats.audioSamplesPadded += frames;
+      stats.samplesPadded += frames;
     } else {
 
-      stats.audioSamplesTrimmed -= frames;
+      stats.samplesTrimmed -= frames;
     }
-  });
+  }, () => { stats.reanchors++; });
 
-  let lastFrame: Nullable<Buffer> = null;
-  let warnedRejection = false;
+  const parser = createRawMessageParser((message) => {
 
-  // Each track's first message is logged once at debug level: its format and its timestamp are what an operator needs to see when the pipes misbehave.
-  const firstSeen = new Set<string>();
-
-  const noteFirst = (message: RawMessage): void => {
-
-    if(firstSeen.has(message.kind)) {
-
-      return;
-    }
-
-    firstSeen.add(message.kind);
-    LOG.debug("streaming:ffmpeg", "Raw capture's first %s message: timestamp %dus, %s.", message.kind, message.timestamp, (message.kind === "video") ?
-      message.format + " " + String(message.width) + "x" + String(message.height) : String(message.channels) + "ch " + String(message.sampleRate) + "Hz");
-  };
-
-  const writeFrame = (frame: Buffer): void => {
-
-    videoOut.write(frame);
-    stats.framesWritten++;
-  };
-
-  const handleVideo = (message: RawVideoMessage): void => {
-
-    const frame = ((message.width === width) && (message.height === height)) ? toI420(message) : null;
-
-    if(!frame) {
-
-      stats.framesRejected++;
-
-      if(!warnedRejection) {
-
-        warnedRejection = true;
-        LOG.warn("Raw capture sent a frame the encoder pipe cannot take (%s %dx%d, expected %dx%d); such frames are skipped.", message.format, message.width,
-          message.height, width, height);
-      }
-
-      return;
-    }
-
-    const placement = placeVideo(message.timestamp);
-
-    if(lastFrame) {
-
-      for(let i = 0; i < placement.repeats; i++) {
-
-        writeFrame(lastFrame);
-        stats.framesRepeated++;
-      }
-    }
-
-    if(placement.emit) {
-
-      writeFrame(frame);
-    } else {
-
-      stats.framesDropped++;
-    }
-
-    // Kept for repeats without a copy: the parser only ever slices its buffers and replaces them, never writes into one, so the bytes stay as they are.
-    lastFrame = frame;
-  };
-
-  const handleAudio = (message: RawAudioMessage): void => {
-
-    const samples = placeAudio(message.timestamp, toStereoOutput(message));
+    const samples = place(message.timestamp, toStereoOutput(message));
 
     if(samples.length > 0) {
 
       audioOut.write(Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength));
-    }
-  };
-
-  const parser = createRawMessageParser((message) => {
-
-    noteFirst(message);
-
-    if(message.kind === "video") {
-
-      handleVideo(message);
-    } else {
-
-      handleAudio(message);
+      stats.blocksWritten++;
     }
   });
 
@@ -597,7 +293,6 @@ export function createRawPump(options: RawPumpOptions): RawPump {
 
     final: (callback): void => {
 
-      videoOut.end();
       audioOut.end();
       callback();
     },
@@ -614,9 +309,9 @@ export function createRawPump(options: RawPumpOptions): RawPump {
         return;
       }
 
-      if(videoOut.writableLength > maxBufferedBytes) {
+      if(audioOut.writableLength > maxBufferedBytes) {
 
-        callback(new Error("The video encoder fell behind the capture: " + String(Math.round(videoOut.writableLength / 1048576)) + "MB of frames are waiting."));
+        callback(new Error("The encoder stopped reading its audio: " + String(Math.round(audioOut.writableLength / 1024)) + "KB are waiting."));
 
         return;
       }

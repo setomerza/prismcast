@@ -2,20 +2,23 @@
  *
  * setup.encoderMode.test.ts: Tests for the FFmpeg encoder mode in createPageWithCapture and the plan that selects it.
  *
- * The mode changes three things about an establishment and nothing else: the capture asks the extension for the raw recorder, the FFmpeg spawned is the encoder
- * (with its audio pipe) rather than the remuxer, and the capture is piped into the pacing pump rather than into FFmpeg. These rows drive the real
- * createPageWithCapture on the static branch, as setup.ffmpegWiring.test.ts does, with the capture options and both spawns recorded, so each row reads which path
- * an establishment took, what the encoder was asked for, and that a host without the encoder falls back to the default path rather than failing the stream.
+ * The mode changes four things about an establishment and nothing else: the page is a capture window of its own rather than a tab of the shared window, the
+ * capture asks the extension for the raw audio recorder, the FFmpeg spawned is the encoder - grabbing the window's rectangle of the screen, with its audio pipe -
+ * rather than the remuxer, and the capture is piped into the audio pump rather than into FFmpeg. These rows drive the real createPageWithCapture on the static
+ * branch, as setup.ffmpegWiring.test.ts does, with the page opened, the capture options, and both spawns recorded, so each row reads which path an establishment
+ * took, what the encoder was asked for, and that a stream with no encoder or no window falls back to the default path rather than failing.
  */
 import type { Browser, Page } from "puppeteer-core";
 import type { CaptureStream, CaptureStreamOptions } from "../browser/tabCapture.ts";
 import type { EncoderFFmpegOptions, EncoderFFmpegProcess, FFmpegProcess } from "../utils/index.ts";
-import { RAW_HEADER_SIZE, RAW_KIND_VIDEO, RAW_PIXEL_FORMATS } from "../browser/rawCapture.ts";
 import { beforeEach, describe, test } from "node:test";
-import { createPageWithCapture, resolveEncoderPlan } from "./setup.ts";
+import { createPageWithCapture, resolveEncoderPlan, withoutNativeFullscreen } from "./setup.ts";
+import type { CaptureWindow } from "../browser/captureWindows.ts";
 import type { CreatePageWithCaptureDeps } from "./setup.ts";
+import { EventEmitter } from "node:events";
 import { LOG } from "../utils/index.ts";
 import { PassThrough } from "node:stream";
+import { RAW_HEADER_SIZE } from "../browser/rawCapture.ts";
 import type { StreamSettings } from "../config/streamSettings.ts";
 import assert from "node:assert/strict";
 import { closePuppeteerStreamWssOnIdle } from "../testing.helpers.ts";
@@ -29,15 +32,43 @@ closePuppeteerStreamWssOnIdle();
 // The binary the encoder search answers in the rows where it finds one.
 const ENCODER_BINARY = "/test/encoder/ffmpeg";
 
+// The rectangle the stub capture window's content occupies.
+const WINDOW_RECT = { height: 720, width: 1280, x: 1297, y: 90 };
+
 // What the current row's establishment did.
 let acquiredOptions: CaptureStreamOptions[];
 let captureStream: PassThrough;
 let encoderSpawns: { bin: string; options: EncoderFFmpegOptions }[];
 let encoderProcess: EncoderFFmpegProcess & { kills: () => number };
 let faults: Error[];
+let openedPages: string[];
+let releases: number;
 let remuxSpawns: number;
 let searches: string[];
 let searchAnswer: string | undefined;
+let windowAnswer: "none" | "open" | "throws";
+
+/**
+ * Builds a stub page for the static-capture pipeline, tagged so a row can tell which opener produced it.
+ * @param tag - Which opener produced the page.
+ * @returns The page.
+ */
+function makeStubPage(tag: string): Page {
+
+  const emitter = new EventEmitter();
+
+  openedPages.push(tag);
+
+  return {
+
+    close: async (): Promise<void> => { emitter.emit("close"); },
+    evaluateOnNewDocument: async (): Promise<void> => { /* No real document on a stub. */ },
+    goto: async (): Promise<void> => { /* The static branch navigates once. */ },
+    isClosed: (): boolean => false,
+    once: (event: string, listener: () => void): unknown => emitter.once(event, listener),
+    setBypassCSP: async (): Promise<void> => { /* Nothing to bypass on a stub. */ }
+  } as unknown as Page;
+}
 
 const deps: CreatePageWithCaptureDeps = {
 
@@ -49,17 +80,19 @@ const deps: CreatePageWithCaptureDeps = {
     return captureStream as unknown as CaptureStream;
   },
   awaitCaptureVerdict: async (): Promise<null> => null,
-  emulateCaptureSurface: async (): Promise<{ height: number; width: number }> => ({ height: 2, width: 4 }),
+  emulateCaptureSurface: async (): Promise<{ height: number; width: number }> => ({ height: 720, width: 1280 }),
   getCurrentBrowser: async (): Promise<Browser> => ({ connected: false } as unknown as Browser),
   installActivationHeal: async (): Promise<void> => { /* Nothing to enrol on a stub page. */ },
-  openSharedWindowTab: async (): Promise<Page> => ({
+  openCaptureWindow: async (): Promise<CaptureWindow | null> => {
 
-    close: async (): Promise<void> => { /* Nothing to close on a stub. */ },
-    evaluateOnNewDocument: async (): Promise<void> => { /* No real document on a stub. */ },
-    goto: async (): Promise<void> => { /* The static branch navigates once. */ },
-    isClosed: (): boolean => false,
-    setBypassCSP: async (): Promise<void> => { /* Nothing to bypass on a stub. */ }
-  } as unknown as Page),
+    if(windowAnswer === "throws") {
+
+      throw new Error("The window could not be opened.");
+    }
+
+    return (windowAnswer === "open") ? { page: makeStubPage("window"), rect: WINDOW_RECT, release: (): void => { releases++; } } : null;
+  },
+  openSharedWindowTab: async (): Promise<Page> => makeStubPage("tab"),
   reaffirmCaptureSurface: async (): Promise<void> => { /* No compositor on a stub. */ },
   resolveEncoderFFmpegPath: async (encoder: string): Promise<string | undefined> => {
 
@@ -87,9 +120,9 @@ const deps: CreatePageWithCaptureDeps = {
 /**
  * Establishes a capture through the real createPageWithCapture on the static branch.
  * @param settings - The stream's settings.
- * @returns The disposer of the established capture session.
+ * @returns The disposer of the established capture session and page.
  */
-async function establish(settings: StreamSettings): Promise<() => void> {
+async function establish(settings: StreamSettings): Promise<() => Promise<void>> {
 
   const result = await createPageWithCapture({
 
@@ -101,25 +134,30 @@ async function establish(settings: StreamSettings): Promise<() => void> {
     url: "https://static.example/page"
   }, deps);
 
-  return (): void => { result.captureSession.dispose(); };
+  return async (): Promise<void> => {
+
+    result.captureSession.dispose();
+    await result.page.close();
+  };
 }
 
 /**
- * Builds one raw I420 frame message for a 4x2 surface.
- * @param marker - The luma fill.
+ * Builds one raw audio message: stereo 48 kHz, constant samples.
+ * @param frames - Frames per channel.
  * @returns The framed message.
  */
-function rawFrame(marker: number): Buffer {
+function rawAudio(frames: number): Buffer {
 
-  const payload = Buffer.alloc(12, 128).fill(marker, 0, 8);
+  const payload = Buffer.alloc(frames * 2 * 4);
   const header = Buffer.alloc(RAW_HEADER_SIZE);
 
+  payload.fill(0);
   header.writeUInt32LE(RAW_HEADER_SIZE + payload.length, 0);
-  header.writeUInt8(RAW_KIND_VIDEO, 4);
-  header.writeUInt8(RAW_PIXEL_FORMATS["I420"]!, 5);
+  header.writeUInt8(2, 4);
+  header.writeUInt8(2, 5);
   header.writeDoubleLE(0, 8);
-  header.writeUInt32LE(4, 16);
-  header.writeUInt32LE(2, 20);
+  header.writeUInt32LE(48000, 16);
+  header.writeUInt32LE(frames, 20);
 
   return Buffer.concat([ header, payload ]);
 }
@@ -130,64 +168,92 @@ beforeEach(() => {
   encoderSpawns = [];
   encoderProcess = { ...makeFakeFFmpeg(), audioIn: new PassThrough() };
   faults = [];
+  openedPages = [];
+  releases = 0;
   remuxSpawns = 0;
   searchAnswer = ENCODER_BINARY;
   searches = [];
+  windowAnswer = "open";
 });
 
 describe("createPageWithCapture: the FFmpeg encoder mode", () => {
 
-  test("the browser encoder runs the default path and never searches for an encoder", async () => {
+  test("the browser encoder runs the default path: a shared-window tab, the extension's recorder, the remuxer", async () => {
 
     const dispose = await establish(makeStreamSettings());
 
-    assert.equal(acquiredOptions[0]?.recorder, undefined, "the capture runs the extension's own recorder");
-    assert.ok(!("recorder" in (acquiredOptions[0] ?? {})), "and the options carry no recorder key at all, as before the mode existed");
+    assert.deepEqual(openedPages, ["tab"], "the page is a tab of the shared window");
+    assert.ok(!("recorder" in (acquiredOptions[0] ?? {})), "the options carry no recorder key at all, as before the mode existed");
     assert.equal(remuxSpawns, 1, "the remuxer was spawned");
     assert.equal(encoderSpawns.length, 0, "the encoder was not");
     assert.deepEqual(searches, [], "no encoder search ran");
 
-    dispose();
+    await dispose();
   });
 
-  test("the ffmpeg encoder asks for raw capture, spawns the encoder with the stream's values, and pumps frames into it", async () => {
+  test("the ffmpeg encoder opens a capture window, captures audio raw, and grabs the window's rectangle", async () => {
 
     const settings = makeStreamSettings({ audioBitsPerSecond: 128000, ffmpegVideoEncoder: "h264_nvenc", frameRate: 30, segmentDuration: 2, videoBitsPerSecond: 6000000,
       videoEncoder: "ffmpeg" });
     const dispose = await establish(settings);
 
-    assert.equal(acquiredOptions[0]?.recorder, "raw", "the capture runs the raw recorder");
+    assert.deepEqual(openedPages, ["window"], "the page is a capture window of its own");
+    assert.equal(acquiredOptions[0]?.recorder, "raw", "the capture runs the raw audio recorder");
     assert.equal(remuxSpawns, 0, "no remuxer was spawned");
     assert.deepEqual(encoderSpawns, [{
 
       bin: ENCODER_BINARY,
-      options: { audioBitrate: 128000, comment: undefined, encoder: "h264_nvenc", frameRate: 30, height: 2, keyframeInterval: 60, videoBitrate: 6000000, width: 4 }
-    }], "the encoder runs the found binary at the surface's size, the stream's rates, and a keyframe per segment");
+      options: { audioBitrate: 128000, comment: undefined, encoder: "h264_nvenc", frameRate: 30, grab: { display: process.env["DISPLAY"] ?? ":99", x: 1297, y: 90 },
+        height: 720, keyframeInterval: 60, videoBitrate: 6000000, width: 1280 }
+    }], "the encoder grabs the window's content rectangle at the stream's rates, with a keyframe per segment");
 
     const written: Buffer[] = [];
 
-    encoderProcess.stdin.on("data", (chunk: Buffer) => { written.push(chunk); });
-    captureStream.write(rawFrame(7));
+    encoderProcess.audioIn.on("data", (chunk: Buffer) => { written.push(chunk); });
+    captureStream.write(rawAudio(480));
 
     await new Promise((resolve) => setImmediate(resolve));
 
-    assert.equal(written.length, 1, "the capture's frame reached the encoder's stdin through the pump");
-    assert.equal(written[0]?.[0], 7, "as a yuv420p frame");
+    assert.ok(written.length > 0, "the capture's audio reached the encoder's audio pipe through the pump");
 
-    dispose();
+    await dispose();
+
+    assert.equal(releases, 1, "closing the page returned the window's cell");
   });
 
-  test("a host without the encoder falls back to the browser encoder", async () => {
+  test("a host without the encoder falls back to the browser encoder without opening a window", async () => {
 
     searchAnswer = undefined;
 
     const dispose = await establish(makeStreamSettings({ ffmpegVideoEncoder: "libx264", videoEncoder: "ffmpeg" }));
 
     assert.deepEqual(searches, ["libx264"], "the search ran for the configured encoder");
-    assert.ok(!("recorder" in (acquiredOptions[0] ?? {})), "the capture fell back to the extension's own recorder");
-    assert.equal(remuxSpawns, 1, "and the remuxer");
+    assert.deepEqual(openedPages, ["tab"], "no capture window was opened");
+    assert.equal(remuxSpawns, 1, "and the remuxer runs");
 
-    dispose();
+    await dispose();
+  });
+
+  test("a stream that gets no capture window, or whose window fails to open, falls back to the browser encoder", async (t) => {
+
+    t.mock.method(LOG, "warn", () => { /* Captured via the mock. */ });
+
+    for(const answer of [ "none", "throws" ] as const) {
+
+      windowAnswer = answer;
+      openedPages = [];
+      remuxSpawns = 0;
+
+      // eslint-disable-next-line no-await-in-loop -- The two answers are established one after the other.
+      const dispose = await establish(makeStreamSettings({ videoEncoder: "ffmpeg" }));
+
+      assert.deepEqual(openedPages, ["tab"], answer + ": the page is a shared-window tab");
+      assert.ok(!("recorder" in (acquiredOptions.at(-1) ?? {})), answer + ": the extension's own recorder runs");
+      assert.equal(remuxSpawns, 1, answer + ": the remuxer runs");
+
+      // eslint-disable-next-line no-await-in-loop -- Each establishment is torn down before the next.
+      await dispose();
+    }
   });
 
   test("an encoder input error after teardown is not reported, and one on a live pipeline is reported once", async () => {
@@ -199,11 +265,23 @@ describe("createPageWithCapture: the FFmpeg encoder mode", () => {
     assert.equal(faults.length, 1, "a live fault is reported");
     assert.equal(encoderProcess.kills(), 1, "and the encoder is killed");
 
-    encoderProcess.stdin.emit("error", new Error("Another fault, after the kill."));
+    encoderProcess.audioIn.emit("error", new Error("Another fault, after the kill."));
 
     assert.equal(faults.length, 1, "a fault on a torn-down encoder is not reported again");
 
-    dispose();
+    await dispose();
+  });
+});
+
+describe("withoutNativeFullscreen", () => {
+
+  test("turns off the fullscreen key, button, and API and leaves the rest of the profile alone", () => {
+
+    const profile = makeProfile({ fullscreenKey: "f", fullscreenSelector: ".fs", staticCapture: true, useRequestFullscreen: true });
+    const grabbed = withoutNativeFullscreen(profile);
+
+    assert.deepEqual([ grabbed.fullscreenKey, grabbed.fullscreenSelector, grabbed.useRequestFullscreen ], [ null, null, false ]);
+    assert.equal(grabbed.staticCapture, true);
   });
 });
 

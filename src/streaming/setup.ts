@@ -18,11 +18,13 @@ import type { ManifestInterceptionResult, ManifestInterceptorHandle } from "../b
 import type { MonitorHandle, TabReplacementResult } from "./recovery.ts";
 import type { Nullable, ResolvedChannel, ResolvedSiteProfile, TuneResult, UrlValidationResult } from "../types/index.ts";
 import { getAuthDomainForChannel, getServiceDisplayName, resolveServiceKey } from "../config/services.ts";
+import { getCaptureCellPool, openCaptureWindow } from "../browser/captureWindows.ts";
 import { getDomainConfig, getProfileForChannel, getProfileForUrl, resolveProfile } from "../config/profiles.ts";
 import { getProviderByStrategy, invalidateDirectUrl, resolveDirectUrl } from "../browser/channelSelection.ts";
 import { initializePlayback, injectVideoSelector, muteExistingVideos, navigateToPage } from "../browser/video.ts";
 import { CONFIG } from "../config/index.ts";
 import type { CaptureSession } from "./captureSession.ts";
+import type { CaptureWindow } from "../browser/captureWindows.ts";
 import type { Clock } from "homebridge-plugin-utils";
 import type { InitializePlaybackOptions } from "../browser/video.ts";
 import type { MonitorStreamInfo } from "./monitor.ts";
@@ -35,6 +37,7 @@ import { getBuiltinProfile } from "../config/sites.ts";
 import { getCachedEncryption } from "../native/probe.ts";
 import { getCaptureMimeType } from "./codec.ts";
 import { getDomainAuthState } from "../config/health.ts";
+import { getPresetViewport } from "../config/presets.ts";
 import { getUserProfiles } from "../config/userProfiles.ts";
 import { isCaptureInfrastructureError } from "./recovery.ts";
 import { monitorPlaybackHealth } from "./monitor.ts";
@@ -579,11 +582,48 @@ export interface CreatePageWithCaptureDeps {
    */
   readonly resolveEncoderFFmpegPath?: typeof resolveEncoderFFmpegPath;
   readonly spawnEncoderFFmpeg?: typeof spawnEncoderFFmpeg;
+
+  // The capture window opener for the encoder mode, optional for the same reason. Production opens one from the process's cell pool.
+  readonly openCaptureWindow?: (browser: Browser) => Promise<Nullable<CaptureWindow>>;
 }
 
 const defaultCreatePageWithCaptureDeps: CreatePageWithCaptureDeps = { acquireCaptureStream, awaitCaptureVerdict: noteClassifiedCaptureFailure,
   emulateCaptureSurface, getCurrentBrowser, installActivationHeal, openSharedWindowTab, reaffirmCaptureSurface, resolveEncoderFFmpegPath, resolveFFmpegPath,
   spawnEncoderFFmpeg, spawnFFmpeg, startOverlayHandling, syncWindowVisibility };
+
+/**
+ * Opens the process's next capture window for a stream: a window of its own in a free cell of the screen grid, its content area the quality preset's viewport.
+ * Never fails the establishment: a full grid, a window that could not be parked, or a failure opening one all answer null, and the stream takes the default
+ * path.
+ * @param browser - The browser to open the window in.
+ * @param open - The window opener, injected for tests. Defaults to opening one from the process's cell pool.
+ * @returns The capture window, or null.
+ */
+async function openStreamCaptureWindow(browser: Browser, open?: (browser: Browser) => Promise<Nullable<CaptureWindow>>): Promise<Nullable<CaptureWindow>> {
+
+  const content = getPresetViewport(CONFIG);
+
+  try {
+
+    return open ? await open(browser) : await openCaptureWindow(browser, getCaptureCellPool(content, CONFIG.streaming.maxConcurrentStreams), content);
+  } catch(error) {
+
+    LOG.warn("A capture window could not be opened (%s); this stream uses the browser encoder.", formatError(error));
+
+    return null;
+  }
+}
+
+/**
+ * Turns a profile's native fullscreen off: no fullscreen key, no fullscreen button, no fullscreen API. A grabbed capture window has to keep the video inside its
+ * own rectangle, and native fullscreen takes the whole screen; the CSS fill that every capture applies covers the viewport instead.
+ * @param profile - The resolved profile.
+ * @returns The profile without native fullscreen.
+ */
+export function withoutNativeFullscreen(profile: ResolvedSiteProfile): ResolvedSiteProfile {
+
+  return { ...profile, fullscreenKey: null, fullscreenSelector: null, useRequestFullscreen: false };
+}
 
 /**
  * The encoder a stream's capture feeds when FFmpeg encodes its video: the encoder and the FFmpeg found able to use it.
@@ -665,7 +705,7 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
   deps: CreatePageWithCaptureDeps = defaultCreatePageWithCaptureDeps): Promise<CreatePageWithCaptureResult> {
 
   const captureElapsed = startTimer();
-  const { comment, onFFmpegError, profile, settings, streamId, url } = options;
+  const { comment, onFFmpegError, profile: requestedProfile, settings, streamId, url } = options;
 
   /* Bring the window on screen before anything else. Capture reads the compositor's output for the shared window, and that output is only composed correctly for a
    * window the desktop is presenting, so the sync has to land ahead of capture acquisition rather than alongside it. The pending registry entry is already in
@@ -685,7 +725,31 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
    * so a user working in another tab is never moved out of it.
    */
   const browser = await deps.getCurrentBrowser("capture");
-  const page = await deps.openSharedWindowTab(browser, { deps: SHARED_WINDOW_TOPOLOGY });
+
+  /* The FFmpeg encoder mode grabs the video off the screen, so its page gets a window of its own at a known rectangle rather than a tab of the shared window.
+   * Who encodes is therefore decided before the page exists - the decision can also await the encoder search's test encode, which must not sit between acquiring
+   * the capture and owning it - and a stream that gets no window (the grid is full, or the window could not be parked) takes the default path instead. Without a
+   * plan, everything below runs exactly as it always has.
+   */
+  let encoderPlan = await resolveEncoderPlan(settings, deps.resolveEncoderFFmpegPath);
+  const captureWindow = encoderPlan ? await openStreamCaptureWindow(browser, deps.openCaptureWindow) : null;
+
+  if(!captureWindow) {
+
+    encoderPlan = null;
+  }
+
+  const page = captureWindow?.page ?? await deps.openSharedWindowTab(browser, { deps: SHARED_WINDOW_TOPOLOGY });
+
+  // A capture window's cell goes back to the pool when its page closes, however that happens.
+  if(captureWindow) {
+
+    page.once("close", captureWindow.release);
+  }
+
+  // A grabbed window must keep its content in its own rectangle, so a profile's native fullscreen - a key, a button, or the API, any of which takes the whole
+  // screen - is off for it and the CSS fill covers the viewport instead.
+  const profile = captureWindow ? withoutNativeFullscreen(requestedProfile) : requestedProfile;
 
   // Register the page as held in flight: the registry does not record it against the stream until setup finishes, so the mark is what keeps stale page cleanup
   // from closing it mid-tune.
@@ -716,9 +780,6 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
   // the single owner from the instant the stream exists. Falls back to "ffmpeg" so spawn() defers to PATH lookup.
   const ffmpegBin = (await deps.resolveFFmpegPath()) ?? "ffmpeg";
 
-  // Who encodes the video is decided here too, for the same reason: the encoder search can await a test encode, which must not sit between acquiring the capture
-  // and owning it. With a plan, the capture runs the raw recorder and FFmpeg encodes; without one, everything below runs exactly as it always has.
-  const encoderPlan = await resolveEncoderPlan(settings, deps.resolveEncoderFFmpegPath);
   const spawnEncoder = deps.spawnEncoderFFmpeg ?? spawnEncoderFFmpeg;
 
   // The capture-pipeline composite, assigned once the raw capture stream and its FFmpeg child exist and registered on the DisposableStack the moment it is built.
@@ -815,28 +876,30 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
       }
     };
 
-    /* In the encoder mode FFmpeg encodes rather than remuxes: the pump between the capture and FFmpeg turns the raw recorder's messages into constant-rate
-     * yuv420p on stdin and aligned audio on the extra pipe, and the capture is piped into the pump instead of into FFmpeg. Keyframes land every segment
-     * duration, because the segmenter cuts there.
+    /* In the encoder mode FFmpeg encodes rather than remuxes: it grabs the video from the capture window's rectangle of the X display, stamping it with the wall
+     * clock from its start, and the pump between the capture and FFmpeg turns the raw recorder's audio into PCM level with that clock on the extra pipe. The
+     * capture is piped into the pump instead of into FFmpeg. Keyframes land every segment duration, because the segmenter cuts there.
      */
     let ffmpeg: FFmpegProcess;
     let captureSink: Writable;
 
-    if(encoderPlan) {
+    if(encoderPlan && captureWindow) {
 
+      const startedAt = systemClock.now();
       const encoderProcess = spawnEncoder(encoderPlan.ffmpegBin, {
 
         audioBitrate: settings.audioBitsPerSecond,
         comment,
         encoder: encoderPlan.encoder,
         frameRate: settings.frameRate,
-        height: surface.height,
+        grab: { display: process.env["DISPLAY"] ?? ":99", x: captureWindow.rect.x, y: captureWindow.rect.y },
+        height: captureWindow.rect.height,
         keyframeInterval: Math.max(1, Math.round(settings.frameRate * settings.segmentDuration)),
         videoBitrate: settings.videoBitsPerSecond,
-        width: surface.width
+        width: captureWindow.rect.width
       }, onProcessError, streamId);
 
-      // The pump writes FFmpeg's two input pipes directly rather than through pipeline(), so their errors are handled here: a closed pipe is teardown's or
+      // The pump writes FFmpeg's audio pipe directly rather than through pipeline(), so the pipes' errors are handled here: a closed pipe is teardown's or
       // FFmpeg's own exit, which the exit handler reports; anything else is a fault in its own right.
       for(const input of [ encoderProcess.stdin, encoderProcess.audioIn ]) {
 
@@ -858,8 +921,7 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
       }
 
       ffmpeg = encoderProcess;
-      captureSink = createRawPump({ audioOut: encoderProcess.audioIn, frameRate: settings.frameRate, height: surface.height, videoOut: encoderProcess.stdin,
-        width: surface.width });
+      captureSink = createRawPump({ audioOut: encoderProcess.audioIn, startedAt });
     } else {
 
       ffmpeg = deps.spawnFFmpeg(ffmpegBin, settings.audioBitsPerSecond, onProcessError, streamId, comment);

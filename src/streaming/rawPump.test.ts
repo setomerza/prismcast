@@ -1,14 +1,15 @@
 /* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * rawPump.test.ts: Unit tests for the raw capture pump: the message framing it parses, the pixel and sample conversions, the two pacers that turn timestamped
- * arrivals into regular streams, and the pump that ties them to FFmpeg's pipes. Messages are built here with the same layout the recorder writes, and the pipes
- * are in-memory writables, so nothing outside Node is involved.
+ * rawPump.test.ts: Unit tests for the raw audio pump: the message framing it parses, the sample conversion, the pacer that keeps the audio level with the wall
+ * clock the grabbed video runs on, and the pump that ties them to FFmpeg's audio pipe. Messages are built here with the layout the recorder writes, the pipe is an
+ * in-memory writable, and time is a virtual clock, so nothing outside Node is involved.
  */
-import { RAW_AUDIO_CHANNELS, RAW_AUDIO_SAMPLE_RATE, RAW_AUDIO_TOLERANCE_SAMPLES, RAW_MAX_GAP_US, createAudioPacer, createRawMessageParser, createRawPump,
-  createVideoPacer, toI420, toStereoOutput } from "./rawPump.ts";
-import { RAW_HEADER_SIZE, RAW_KIND_AUDIO, RAW_KIND_VIDEO, RAW_PIXEL_FORMATS } from "../browser/rawCapture.ts";
-import type { RawAudioMessage, RawMessage, RawTimeline, RawVideoMessage } from "./rawPump.ts";
+import { RAW_AUDIO_CHANNELS, RAW_AUDIO_DRIFT_LIMIT_SAMPLES, RAW_AUDIO_SAMPLE_RATE, RAW_AUDIO_TOLERANCE_SAMPLES, createAudioPacer, createRawMessageParser,
+  createRawPump, toStereoOutput } from "./rawPump.ts";
+import { RAW_HEADER_SIZE, RAW_KIND_AUDIO } from "../browser/rawCapture.ts";
 import { describe, test } from "node:test";
+import type { RawAudioMessage } from "./rawPump.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import { Writable } from "node:stream";
 import assert from "node:assert/strict";
 
@@ -17,42 +18,25 @@ import assert from "node:assert/strict";
 /**
  * Builds one message in the recorder's wire layout.
  * @param kind - The message kind.
- * @param detail - The format code or channel count.
+ * @param channels - The channel count.
  * @param timestamp - Microseconds.
- * @param first - Width or sample rate.
- * @param second - Height or frames.
+ * @param sampleRate - The block's rate.
+ * @param frames - Frames per channel.
  * @param payload - The payload bytes.
  * @returns The framed message.
  */
-function frameMessage(kind: number, detail: number, timestamp: number, first: number, second: number, payload: Buffer): Buffer {
+function frameMessage(kind: number, channels: number, timestamp: number, sampleRate: number, frames: number, payload: Buffer): Buffer {
 
   const header = Buffer.alloc(RAW_HEADER_SIZE);
 
   header.writeUInt32LE(RAW_HEADER_SIZE + payload.length, 0);
   header.writeUInt8(kind, 4);
-  header.writeUInt8(detail, 5);
+  header.writeUInt8(channels, 5);
   header.writeDoubleLE(timestamp, 8);
-  header.writeUInt32LE(first, 16);
-  header.writeUInt32LE(second, 20);
+  header.writeUInt32LE(sampleRate, 16);
+  header.writeUInt32LE(frames, 20);
 
   return Buffer.concat([ header, payload ]);
-}
-
-/**
- * Builds an I420 video message whose luma is filled with one value, so frames can be told apart in the output.
- * @param timestamp - Microseconds.
- * @param marker - The luma fill.
- * @param width - Frame width.
- * @param height - Frame height.
- * @returns The framed message.
- */
-function videoMessage(timestamp: number, marker: number, width = 4, height = 2): Buffer {
-
-  const payload = Buffer.alloc(width * height * 1.5, 128);
-
-  payload.fill(marker, 0, width * height);
-
-  return frameMessage(RAW_KIND_VIDEO, RAW_PIXEL_FORMATS["I420"]!, timestamp, width, height, payload);
 }
 
 /**
@@ -76,7 +60,7 @@ function audioMessage(timestamp: number, frames: number, value: number): Buffer 
 
 /**
  * An in-memory pipe that keeps every write.
- * @returns The writable and the chunks it received.
+ * @returns The writable, the chunks it received, and whether it was ended.
  */
 function makeSink(): { chunks: Buffer[]; ended: () => boolean; sink: Writable } {
 
@@ -128,11 +112,9 @@ describe("createRawMessageParser", () => {
 
   test("parses whole messages, messages split across chunks, and several messages in one chunk", () => {
 
-    const messages: RawMessage[] = [];
+    const messages: RawAudioMessage[] = [];
     const parser = createRawMessageParser((message) => { messages.push(message); });
-    const first = videoMessage(1000, 10);
-    const second = audioMessage(2000, 4, 0.5);
-    const both = Buffer.concat([ first, second ]);
+    const both = Buffer.concat([ audioMessage(1000, 4, 0.5), audioMessage(2000, 8, 0.25) ]);
 
     // One byte at a time is the harshest split there is.
     for(let i = 0; i < both.length; i++) {
@@ -143,24 +125,20 @@ describe("createRawMessageParser", () => {
     parser.push(both);
 
     assert.equal(messages.length, 4, "every message is emitted once, however it was split");
-
-    const video = messages[0] as RawVideoMessage;
-    const audio = messages[1] as RawAudioMessage;
-
-    assert.deepEqual([ video.kind, video.format, video.width, video.height, video.timestamp, video.data.length ], [ "video", "I420", 4, 2, 1000, 12 ]);
-    assert.deepEqual([ audio.kind, audio.channels, audio.sampleRate, audio.frames, audio.timestamp ], [ "audio", 2, RAW_AUDIO_SAMPLE_RATE, 4, 2000 ]);
+    assert.deepEqual([ messages[0]?.channels, messages[0]?.sampleRate, messages[0]?.frames, messages[0]?.timestamp ], [ 2, RAW_AUDIO_SAMPLE_RATE, 4, 1000 ]);
+    assert.deepEqual([ messages[1]?.frames, messages[1]?.timestamp, messages[1]?.data.length ], [ 8, 2000, 64 ]);
   });
 
-  test("skips messages of an unknown kind and names an unknown format as such", () => {
+  test("skips messages of any other kind, including the retired video kind", () => {
 
-    const messages: RawMessage[] = [];
+    const messages: RawAudioMessage[] = [];
     const parser = createRawMessageParser((message) => { messages.push(message); });
 
+    parser.push(frameMessage(1, 0, 0, 4, 2, Buffer.alloc(12)));
     parser.push(frameMessage(9, 0, 0, 0, 0, Buffer.alloc(4)));
-    parser.push(frameMessage(RAW_KIND_VIDEO, 0, 0, 2, 2, Buffer.alloc(6)));
+    parser.push(audioMessage(0, 1, 0));
 
-    assert.equal(messages.length, 1, "the unknown kind was skipped");
-    assert.equal((messages[0] as RawVideoMessage).format, "unknown");
+    assert.equal(messages.length, 1);
   });
 
   test("throws on broken framing rather than guessing", () => {
@@ -174,49 +152,7 @@ describe("createRawMessageParser", () => {
   });
 });
 
-// Conversions.
-
-describe("toI420", () => {
-
-  const base = { kind: "video" as const, timestamp: 0 };
-
-  test("passes I420 through and splits NV12's interleaved chroma", () => {
-
-    const i420 = Buffer.from([ 1, 2, 3, 4, 5, 6, 7, 8, 20, 21, 30, 31 ]);
-
-    assert.deepEqual(toI420({ ...base, data: i420, format: "I420", height: 2, width: 4 }), i420);
-
-    const nv12 = Buffer.from([ 1, 2, 3, 4, 5, 6, 7, 8, 20, 30, 21, 31 ]);
-
-    assert.deepEqual([...toI420({ ...base, data: nv12, format: "NV12", height: 2, width: 4 })!], [ 1, 2, 3, 4, 5, 6, 7, 8, 20, 21, 30, 31 ]);
-  });
-
-  test("converts RGB with limited-range BT.709, honoring byte order", () => {
-
-    const white = Buffer.alloc(16, 255);
-    const converted = toI420({ ...base, data: white, format: "RGBA", height: 2, width: 2 })!;
-
-    assert.deepEqual([...converted], [ 235, 235, 235, 235, 128, 128 ], "white is Y 235 with neutral chroma");
-
-    // Pure red in RGBA and the same bytes read as BGRA (pure blue) must land on opposite sides of neutral Cb.
-    const red = Buffer.from(Array.from({ length: 4 }, () => [ 255, 0, 0, 255 ]).flat());
-    const asRed = toI420({ ...base, data: red, format: "RGBA", height: 2, width: 2 })!;
-    const asBlue = toI420({ ...base, data: red, format: "BGRA", height: 2, width: 2 })!;
-
-    assert.ok(asRed[4]! < 128, "red has Cb below neutral");
-    assert.ok(asRed[5]! > 200, "red has a high Cr");
-    assert.ok(asBlue[4]! > 200, "blue has a high Cb");
-  });
-
-  test("refuses odd sizes, short payloads, and unknown formats", () => {
-
-    assert.equal(toI420({ ...base, data: Buffer.alloc(100), format: "I420", height: 3, width: 3 }), null);
-    assert.equal(toI420({ ...base, data: Buffer.alloc(5), format: "I420", height: 2, width: 4 }), null);
-    assert.equal(toI420({ ...base, data: Buffer.alloc(5), format: "NV12", height: 2, width: 4 }), null);
-    assert.equal(toI420({ ...base, data: Buffer.alloc(5), format: "RGBA", height: 2, width: 4 }), null);
-    assert.equal(toI420({ ...base, data: Buffer.alloc(100), format: "unknown", height: 2, width: 4 }), null);
-  });
-});
+// Conversion.
 
 describe("toStereoOutput", () => {
 
@@ -226,7 +162,7 @@ describe("toStereoOutput", () => {
 
     samples.forEach((sample, i) => { bytes.writeFloatLE(sample, (i * 4) + (misalign ? 1 : 0)); });
 
-    return { channels, data: misalign ? bytes.subarray(1) : bytes, frames, kind: "audio", sampleRate, timestamp: 0 };
+    return { channels, data: misalign ? bytes.subarray(1) : bytes, frames, sampleRate, timestamp: 0 };
   };
 
   test("interleaves stereo, duplicates mono, and drops channels past the second", () => {
@@ -253,104 +189,85 @@ describe("toStereoOutput", () => {
   test("an empty or short block becomes nothing", () => {
 
     assert.equal(toStereoOutput(block(0, 0, 48000, [])).length, 0);
-    assert.equal(toStereoOutput({ channels: 2, data: Buffer.alloc(4), frames: 4, kind: "audio", sampleRate: 48000, timestamp: 0 }).length, 0);
+    assert.equal(toStereoOutput({ channels: 2, data: Buffer.alloc(4), frames: 4, sampleRate: 48000, timestamp: 0 }).length, 0);
   });
 });
 
 // Pacing.
 
-describe("createVideoPacer", () => {
-
-  test("places frames by timestamp: on time, late with repeats, and early without a write", () => {
-
-    const timeline: RawTimeline = { videoPositionUs: null };
-    const place = createVideoPacer(timeline, 30);
-    const interval = 1000000 / 30;
-
-    assert.deepEqual(place(5000000), { emit: true, repeats: 0 }, "the first frame anchors the track and is written");
-    assert.equal(timeline.videoPositionUs, 0, "the first frame starts the output");
-    assert.deepEqual(place(5000000 + interval), { emit: true, repeats: 0 }, "the next slot, on time");
-    assert.deepEqual(place(5000000 + (4 * interval)), { emit: true, repeats: 2 }, "two missed slots are repeats of the previous frame");
-    assert.deepEqual(place(5000000 + (4.2 * interval)), { emit: false, repeats: 0 }, "a second frame for a slot already written is not written");
-    assert.deepEqual(place(5000000 + (4.6 * interval)), { emit: true, repeats: 0 }, "jitter rounds to the nearest slot");
-    assert.equal(timeline.videoPositionUs, 5 * interval, "the sixth frame starts five intervals in");
-  });
-
-  test("a jump either way re-anchors the track instead of filling the gap, and says so", () => {
-
-    const timeline: RawTimeline = { videoPositionUs: null };
-    let stalls = 0;
-    const place = createVideoPacer(timeline, 30, () => { stalls++; });
-
-    place(0);
-    place(33333);
-
-    assert.deepEqual(place(33333 + RAW_MAX_GAP_US + 500000), { emit: true, repeats: 0 }, "a forward jump takes the next slot with no repeats");
-    assert.deepEqual(place(33333 + RAW_MAX_GAP_US + 533333), { emit: true, repeats: 0 }, "and the track carries on from its new anchor");
-    assert.deepEqual(place(10), { emit: true, repeats: 0 }, "a clock that restarts backwards also takes the next slot");
-    assert.equal(stalls, 2, "both jumps were reported");
-  });
-});
-
 describe("createAudioPacer", () => {
 
   const samples = (frames: number, value = 0.5): Float32Array => new Float32Array(frames * RAW_AUDIO_CHANNELS).fill(value);
 
-  test("drops audio until video starts, then anchors at the video's position whatever the audio's time base", () => {
+  test("anchors the first block at the wall clock's position, whatever the block's own time base", () => {
 
-    const timeline: RawTimeline = { videoPositionUs: null };
-    const place = createAudioPacer(timeline);
+    let elapsed = 100000;
+    const place = createAudioPacer(() => elapsed);
 
-    assert.equal(place(0, samples(480)).length, 0, "no video yet");
-
-    // The audio's clock is unrelated to the video's: its timestamps are in the billions while the video's started at zero. The video has written 100ms.
-    timeline.videoPositionUs = 100000;
-
+    // The track's clock reads in the billions; the encoder has been running 100ms, so the block lands after 100ms of silence.
     const first = place(9000000000, samples(480));
 
-    assert.equal(first.length, (4800 + 480) * 2, "the first block lands at the video's 100ms, after that much silence");
+    assert.equal(first.length, (4800 + 480) * 2, "100ms of silence, then the block");
+    assert.equal(first[0], 0, "the lead-in is silent");
+
+    elapsed += 10000;
+
     assert.equal(place(9000010000, samples(480)).length, 480 * 2, "the next block follows on its own clock");
-    assert.equal(place(9000025000, samples(480)).length, 480 * 2, "5ms late is jitter");
+
+    elapsed += 15000;
+
+    assert.equal(place(9000025000, samples(480)).length, 480 * 2, "5ms late by its own clock is jitter");
   });
 
-  test("re-anchors a block that disagrees with its anchor by more than the gap limit", () => {
+  test("pads a gap with silence and trims an overlap, by the block's own clock", () => {
 
-    const timeline: RawTimeline = { videoPositionUs: 0 };
-    const place = createAudioPacer(timeline);
-
-    place(0, samples(480));
-    timeline.videoPositionUs = 500000;
-
-    // The audio clock jumps three seconds; the video has only moved to 500ms, so the block lands there, after the silence that brings the audio level.
-    const placed = place(RAW_MAX_GAP_US + 1000000, samples(480));
-
-    assert.equal(placed.length, ((24000 - 480) + 480) * 2, "the block landed at the video's position");
-  });
-
-  test("pads a gap with silence and trims an overlap", () => {
-
-    const timeline: RawTimeline = { videoPositionUs: 0 };
+    let elapsed = 0;
     const adjustments: number[] = [];
-    const place = createAudioPacer(timeline, (frames) => { adjustments.push(frames); });
+    const place = createAudioPacer(() => elapsed, (frames) => { adjustments.push(frames); });
 
     place(0, samples(480));
 
-    // The next block lands 100ms later than the 10ms written so far: 90ms of silence first.
-    const padded = place(100000, samples(480));
-    const gap = 4800 - 480;
+    // The next block is stamped 50ms later than the 10ms written so far, and the wall clock agrees: 40ms of silence first.
+    elapsed = 50000;
+
+    const padded = place(50000, samples(480));
+    const gap = 2400 - 480;
 
     assert.equal(padded.length, (gap + 480) * 2, "silence then the block");
-    assert.equal(padded[0], 0, "the pad is silent");
     assert.equal(padded[(gap * 2) + 1], 0.5, "the block follows the pad");
 
-    // The output now reaches 110ms. A block stamped 50ms overlaps by 60ms, more than its own 10ms, so none of it is written.
-    assert.equal(place(50000, samples(480)).length, 0, "a block wholly behind the output is trimmed away");
+    // The output now reaches 60ms. A block stamped 25ms overlaps by 35ms, more than its own 10ms, so none of it is written.
+    assert.equal(place(25000, samples(480)).length, 0, "a block wholly behind the output is trimmed away");
 
     // A block overlapping by more than the tolerance loses only its overlap.
-    const partial = place(110000 - (((RAW_AUDIO_TOLERANCE_SAMPLES + 120) * 1000000) / RAW_AUDIO_SAMPLE_RATE), samples(2000));
+    const overlap = RAW_AUDIO_TOLERANCE_SAMPLES + 120;
+    const partial = place(60000 - ((overlap * 1000000) / RAW_AUDIO_SAMPLE_RATE), samples(2000));
 
-    assert.equal(partial.length, (2000 - (RAW_AUDIO_TOLERANCE_SAMPLES + 120)) * 2, "the overlapping head was trimmed");
-    assert.deepEqual(adjustments, [ gap, -480, -(RAW_AUDIO_TOLERANCE_SAMPLES + 120) ]);
+    assert.equal(partial.length, (2000 - overlap) * 2, "the overlapping head was trimmed");
+    assert.deepEqual(adjustments, [ gap, -480, -overlap ]);
+  });
+
+  test("re-anchors to the wall clock when the block's own clock drifts past the limit", () => {
+
+    let elapsed = 0;
+    let reanchors = 0;
+    const place = createAudioPacer(() => elapsed, () => { /* Not observed. */ }, () => { reanchors++; });
+
+    place(0, samples(480));
+
+    // The track's clock says 10ms passed; the wall clock says a second did. The block lands where the wall clock stands.
+    elapsed = 1000000;
+
+    const placed = place(10000, samples(480));
+
+    assert.equal(reanchors, 1);
+    assert.equal(placed.length, ((48000 - 480) + 480) * 2, "silence up to the wall clock's second, then the block");
+
+    // A drift inside the limit is not a re-anchor.
+    elapsed += 10000 + (((RAW_AUDIO_DRIFT_LIMIT_SAMPLES - 100) * 1000000) / RAW_AUDIO_SAMPLE_RATE);
+    place(20000, samples(480));
+
+    assert.equal(reanchors, 1);
   });
 });
 
@@ -358,66 +275,41 @@ describe("createAudioPacer", () => {
 
 describe("createRawPump", () => {
 
-  test("writes paced yuv420p frames and aligned audio, and ends both pipes when the capture ends", async () => {
+  test("writes aligned audio from the encoder's start and ends the pipe when the capture ends", async () => {
 
-    const video = makeSink();
+    const clock = new TestClock();
     const audio = makeSink();
-    const pump = createRawPump({ audioOut: audio.sink, frameRate: 30, height: 2, videoOut: video.sink, width: 4 });
-    const interval = 1000000 / 30;
+    const pump = createRawPump({ audioOut: audio.sink, clock, startedAt: clock.now() });
 
-    const error = await drive(pump, [
+    // The first block arrives 30ms after the encoder started - past the jitter tolerance, so the lead-in is padded rather than absorbed.
+    clock.advance(30);
 
-      // Audio ahead of the first frame is dropped.
-      audioMessage(0, 480, 0.1),
-      videoMessage(10000, 1),
-      audioMessage(10000, 480, 0.2),
-      videoMessage(10000 + interval, 2),
-
-      // Two slots missed: frame 2 is repeated twice before frame 3.
-      videoMessage(10000 + (4 * interval), 3)
-    ]);
+    const error = await drive(pump, [ audioMessage(5000000, 480, 0.2), audioMessage(5010000, 480, 0.2) ]);
 
     assert.equal(error, undefined);
-    assert.deepEqual(video.chunks.map((frame) => frame[0]), [ 1, 2, 2, 2, 3 ], "frames in slot order, gaps filled by repeating the previous frame");
-    assert.ok(video.chunks.every((frame) => frame.length === 12), "every frame is a whole yuv420p frame");
-    assert.equal(Buffer.concat(audio.chunks).length, 480 * 2 * 4, "only the aligned audio was written");
-    assert.deepEqual(pump.stats, { audioSamplesPadded: 0, audioSamplesTrimmed: 0, framesDropped: 0, framesRejected: 0, framesRepeated: 2, framesWritten: 5,
-      stalls: 0 });
-    assert.ok(video.ended() && audio.ended(), "both pipes ended with the capture");
-  });
-
-  test("skips frames of the wrong size or format and counts them", async () => {
-
-    const video = makeSink();
-    const audio = makeSink();
-    const pump = createRawPump({ audioOut: audio.sink, frameRate: 30, height: 2, videoOut: video.sink, width: 4 });
-
-    await drive(pump, [ videoMessage(0, 1, 8, 2), frameMessage(RAW_KIND_VIDEO, 0, 0, 4, 2, Buffer.alloc(12)), videoMessage(0, 7) ]);
-
-    assert.deepEqual(video.chunks.map((frame) => frame[0]), [7], "only the frame the pipe can take was written");
-    assert.equal(pump.stats.framesRejected, 2);
+    assert.equal(Buffer.concat(audio.chunks).length, (1440 + 480 + 480) * 2 * 4, "30ms of lead-in silence, then two 10ms blocks");
+    assert.deepEqual(pump.stats, { blocksWritten: 2, reanchors: 0, samplesPadded: 1440, samplesTrimmed: 0 });
+    assert.ok(audio.ended(), "the pipe ended with the capture");
   });
 
   test("fails on broken framing", async () => {
 
-    const pump = createRawPump({ audioOut: makeSink().sink, frameRate: 30, height: 2, videoOut: makeSink().sink, width: 4 });
+    const pump = createRawPump({ audioOut: makeSink().sink, startedAt: 0 });
     const broken = Buffer.alloc(RAW_HEADER_SIZE);
 
     broken.writeUInt32LE(1, 0);
 
-    const error = await drive(pump, [broken]);
-
-    assert.match(error?.message ?? "", /framing is broken/);
+    assert.match((await drive(pump, [broken]))?.message ?? "", /framing is broken/);
   });
 
-  test("fails when the encoder falls too far behind", async () => {
+  test("fails when the encoder stops reading its audio", async () => {
+
+    const clock = new TestClock();
 
     // A pipe that never drains: every write stays buffered.
     const stuck = new Writable({ highWaterMark: 1, write: (): void => { /* Never calls back. */ } });
-    const pump = createRawPump({ audioOut: makeSink().sink, frameRate: 30, height: 2, maxBufferedBytes: 20, videoOut: stuck, width: 4 });
+    const pump = createRawPump({ audioOut: stuck, clock, maxBufferedBytes: 100, startedAt: clock.now() });
 
-    const error = await drive(pump, [ videoMessage(0, 1), videoMessage(33333, 2) ]);
-
-    assert.match(error?.message ?? "", /fell behind/);
+    assert.match((await drive(pump, [ audioMessage(0, 480, 0.1), audioMessage(10000, 480, 0.1) ]))?.message ?? "", /stopped reading/);
   });
 });

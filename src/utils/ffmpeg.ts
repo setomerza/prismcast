@@ -688,6 +688,8 @@ export function buildEncoderFFmpegArgs(options: EncoderFFmpegOptions): string[] 
     "-hide_banner",
     "-nostats",
     "-loglevel", "warning",
+    // A grabbing FFmpeg reads nothing from stdin, and without this it would read the pipe there for interactive commands.
+    ...(options.grab ? ["-nostdin"] : []),
     ...videoInput,
     // Continuous 48 kHz stereo float audio, aligned by the pump to the video.
     ...rawInput,
