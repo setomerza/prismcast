@@ -313,3 +313,50 @@ describe("createRawPump", () => {
     assert.match((await drive(pump, [ audioMessage(0, 480, 0.1), audioMessage(10000, 480, 0.1) ]))?.message ?? "", /stopped reading/);
   });
 });
+
+
+describe("screen-capture audio calibration", () => {
+
+  test("advances late audio by 250ms by reducing its lead-in", async () => {
+
+    const clock = new TestClock();
+    const audio = makeSink();
+    const pump = createRawPump({ audioAdvanceMs: 250, audioOut: audio.sink, clock, startedAt: clock.now() });
+
+    clock.advance(300);
+
+    assert.equal(await drive(pump, [audioMessage(5000000, 480, 0.5)]), undefined);
+    const output = Buffer.concat(audio.chunks);
+
+    assert.equal(output.length, (2400 + 480) * 8, "50ms silence instead of 300ms, followed by the audio");
+    assert.equal(output.readFloatLE(2400 * 8), 0.5);
+  });
+
+  test("negative correction delays early audio", async () => {
+
+    const clock = new TestClock();
+    const audio = makeSink();
+    const pump = createRawPump({ audioAdvanceMs: -250, audioOut: audio.sink, clock, startedAt: clock.now() });
+
+    clock.advance(30);
+
+    assert.equal(await drive(pump, [audioMessage(5000000, 480, 0.5)]), undefined);
+    assert.equal(Buffer.concat(audio.chunks).length, (13440 + 480) * 8, "280ms silence before the audio");
+  });
+
+  test("drops samples moved before video zero and retains correction after a clock restart", async () => {
+
+    const clock = new TestClock();
+    const audio = makeSink();
+    const pump = createRawPump({ audioAdvanceMs: 250, audioOut: audio.sink, clock, startedAt: clock.now() });
+
+    clock.advance(30);
+    pump.write(audioMessage(5000000, 480, 0.25));
+    assert.equal(audio.chunks.length, 0, "the block moved before video zero is dropped");
+    clock.advance(970);
+
+    assert.equal(await drive(pump, [audioMessage(0, 480, 0.5)]), undefined);
+    assert.equal(pump.stats.reanchors, 1);
+    assert.equal(Buffer.concat(audio.chunks).length, (36000 + 480) * 8, "re-anchor lands at 750ms, retaining the 250ms advance");
+  });
+});

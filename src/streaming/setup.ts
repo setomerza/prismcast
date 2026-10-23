@@ -896,6 +896,7 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
       const rect = captureWindow.rect;
       const deferred = createDeferredEncoder({
 
+        audioAdvanceMs: settings.ffmpegAudioAdvanceMs,
         clock: systemClock,
         spawn: (): EncoderFFmpegProcess => {
 

@@ -22,6 +22,8 @@ export interface StreamSettings {
   readonly audioBitsPerSecond: Config["streaming"]["audioBitsPerSecond"];
 
   // The FFmpeg encoder the stream's video is encoded with when videoEncoder is "ffmpeg".
+  readonly ffmpegAudioAdvanceMs: Config["streaming"]["ffmpegAudioAdvanceMs"];
+
   readonly ffmpegVideoEncoder: Config["streaming"]["ffmpegVideoEncoder"];
 
   // The frame rate the stream's capture bounds hold.
@@ -52,6 +54,7 @@ export function snapshotStreamSettings(config: Config): StreamSettings {
   return Object.freeze({
 
     audioBitsPerSecond: config.streaming.audioBitsPerSecond,
+    ffmpegAudioAdvanceMs: config.streaming.ffmpegAudioAdvanceMs,
     ffmpegVideoEncoder: config.streaming.ffmpegVideoEncoder,
     frameRate: config.streaming.frameRate,
     monitorInterval: config.playback.monitorInterval,

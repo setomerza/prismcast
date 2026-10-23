@@ -316,6 +316,9 @@ export interface StreamingConfig {
   // The FFmpeg video encoder a stream uses when videoEncoder is "ffmpeg": "h264_nvenc" for NVIDIA GPUs, or "libx264" in software.
   ffmpegVideoEncoder: string;
 
+  // Positive values advance captured audio relative to screen video, in milliseconds.
+  ffmpegAudioAdvanceMs: number;
+
   // Target frame rate for video capture. Higher frame rates produce smoother video but require more CPU and bandwidth. 60fps is ideal for sports content; 30fps
   // is sufficient for most television content. The browser may deliver fewer frames if the source content has a lower frame rate.
   frameRate: number;

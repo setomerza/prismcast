@@ -678,9 +678,9 @@ export function buildEncoderFFmpegArgs(options: EncoderFFmpegOptions): string[] 
   const videoSize = String(options.width) + "x" + String(options.height);
 
   // The video input: the stream's region of the X display, grabbed at the frame rate without the pointer, or raw yuv420p frames on stdin that the pump paces to
-  // exactly frameRate per second.
+  // exactly frameRate per second. The screen device already knows its geometry and rate; do not wait for an FPS probe before opening audio.
   const videoInput = options.grab ?
-    [ "-thread_queue_size", "1024", "-f", "x11grab", "-draw_mouse", "0", "-framerate", String(options.frameRate), "-video_size", videoSize, "-i",
+    [ ...rawInput, "-fpsprobesize", "0", "-f", "x11grab", "-draw_mouse", "0", "-framerate", String(options.frameRate), "-video_size", videoSize, "-i",
       x11GrabInput(options.grab) ] :
     [ ...rawInput, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-video_size", videoSize, "-framerate", String(options.frameRate), "-i", "pipe:0" ];
 

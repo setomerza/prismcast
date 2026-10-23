@@ -83,6 +83,9 @@ export interface RawPumpStats {
  */
 export interface DeferredRawPumpOptions {
 
+  // Positive advances late audio; negative delays it. Keep this offset across re-anchors.
+  readonly audioAdvanceMs?: number;
+
   readonly clock?: Clock;
   readonly maxBufferedBytes?: number;
 }
@@ -297,7 +300,7 @@ export function createRawPump(options: RawPumpOptions): RawPump {
  */
 export function createDeferredRawPump(options: DeferredRawPumpOptions = {}): DeferredRawPump {
 
-  const { clock = systemClock, maxBufferedBytes = RAW_PUMP_MAX_BUFFERED_BYTES } = options;
+  const { audioAdvanceMs = 0, clock = systemClock, maxBufferedBytes = RAW_PUMP_MAX_BUFFERED_BYTES } = options;
   const stats: RawPumpStats = { blocksWritten: 0, reanchors: 0, samplesPadded: 0, samplesTrimmed: 0 };
   let target: Nullable<{ audioOut: Writable; place: (timestampUs: number, samples: Float32Array) => Float32Array }> = null;
 
@@ -358,7 +361,7 @@ export function createDeferredRawPump(options: DeferredRawPumpOptions = {}): Def
     target = {
 
       audioOut,
-      place: createAudioPacer(() => (clock.now() - startedAt) * MICROSECONDS_PER_MILLISECOND, (frames) => {
+      place: createAudioPacer(() => (clock.now() - startedAt - audioAdvanceMs) * MICROSECONDS_PER_MILLISECOND, (frames) => {
 
         if(frames > 0) {
 

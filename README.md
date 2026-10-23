@@ -394,3 +394,8 @@ This is mostly of interest to the true developer nerds amongst us.
 [![Build Status](https://img.shields.io/github/actions/workflow/status/hjdhjd/prismcast/ci.yml?color=636382&logo=github&logoColor=%23FFFFFF&style=for-the-badge)](https://github.com/hjdhjd/prismcast/actions?query=workflow%3A%22Continuous+Integration%22)
 [![Dependencies](https://img.shields.io/librariesio/release/npm/prismcast?color=636382&logo=nodedotjs&logoColor=%23FFFFFF&style=for-the-badge)](https://libraries.io/npm/prismcast)
 [![GitHub commits since latest release](https://img.shields.io/github/commits-since/hjdhjd/prismcast/latest?color=636382&logo=github&logoColor=%23FFFFFF&style=for-the-badge)](https://github.com/hjdhjd/prismcast/commits/main)
+
+
+### FFmpeg screen-capture audio calibration
+
+When using the FFmpeg screen encoder, `FFMPEG_AUDIO_ADVANCE_MS` (or `streaming.ffmpegAudioAdvanceMs`) advances late audio by the specified milliseconds. Positive values advance audio; negative values delay it. The default is 0, the range is -2000 to 2000, and a change applies to new streams. For speech trailing the picture by roughly a quarter second, test 250, then adjust in 50 ms steps. This compensates a fixed capture offset; it does not diagnose or repair growing clock drift. Browser-encoder and native streams are unaffected.

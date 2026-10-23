@@ -638,6 +638,18 @@ export const CONFIG_METADATA: Record<string, SettingMetadata[]> = {
     },
     {
 
+      description: "Audio calibration for screen capture. Positive values advance late audio; negative values delay early audio. Applies only to FFmpeg capture.",
+      envVar: "FFMPEG_AUDIO_ADVANCE_MS",
+      label: "FFmpeg Audio Advance",
+      max: 2000,
+      min: -2000,
+      path: "streaming.ffmpegAudioAdvanceMs",
+      reactivity: "next-stream",
+      type: "integer",
+      unit: "ms"
+    },
+    {
+
       description: "The encoder FFmpeg uses when Video Encoder is ffmpeg. h264_nvenc encodes on an NVIDIA GPU; libx264 encodes in software.",
       envVar: "FFMPEG_VIDEO_ENCODER",
       label: "FFmpeg Video Encoder",
@@ -831,6 +843,7 @@ export interface UserStreamingConfig {
   audioBitsPerSecond?: number;
   captureCodecs?: string[];
   captureMode?: string;
+  ffmpegAudioAdvanceMs?: number;
   ffmpegVideoEncoder?: string;
   frameRate?: number;
   maxConcurrentStreams?: number;
@@ -1540,6 +1553,7 @@ export const DEFAULTS: Config = {
     audioBitsPerSecond: 256000,
     captureCodecs: [ CAPTURE_BASELINE_CODEC, "hevc" ],
     captureMode: "ffmpeg",
+    ffmpegAudioAdvanceMs: 0,
     ffmpegVideoEncoder: "h264_nvenc",
     frameRate: 60,
     maxConcurrentStreams: 10,
@@ -1963,8 +1977,8 @@ const SETTINGS_TAB_SECTIONS: { displayName: string; id: string; paths: string[] 
 
     displayName: "Capture",
     id: "capture",
-    paths: [ "streaming.captureMode", "streaming.captureCodecs", "streaming.videoEncoder", "streaming.ffmpegVideoEncoder", "streaming.qualityPreset",
-      "streaming.videoBitsPerSecond", "streaming.audioBitsPerSecond", "streaming.frameRate" ]
+    paths: [ "streaming.captureMode", "streaming.captureCodecs", "streaming.videoEncoder", "streaming.ffmpegVideoEncoder", "streaming.ffmpegAudioAdvanceMs",
+      "streaming.qualityPreset", "streaming.videoBitsPerSecond", "streaming.audioBitsPerSecond", "streaming.frameRate" ]
   },
   {
 

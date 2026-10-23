@@ -45,6 +45,8 @@ export interface DeferredEncoder extends Pick<FFmpegProcess, "isShuttingDown" | 
  */
 export interface DeferredEncoderOptions {
 
+  readonly audioAdvanceMs?: number;
+
   // The clock the encoder's start is read on and the pump paces against.
   readonly clock?: Clock;
 
@@ -62,7 +64,7 @@ export interface DeferredEncoderOptions {
 export function createDeferredEncoder(options: DeferredEncoderOptions): DeferredEncoder {
 
   const { clock = systemClock, spawn } = options;
-  const audioSink = createDeferredRawPump({ clock });
+  const audioSink = createDeferredRawPump({ audioAdvanceMs: options.audioAdvanceMs, clock });
   const stdout = new PassThrough();
 
   let encoder: Nullable<EncoderFFmpegProcess> = null;

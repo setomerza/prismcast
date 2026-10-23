@@ -645,8 +645,8 @@ describe("reactivity classification", () => {
     [ "restart", [ "server.host", "server.port" ] ],
 
     // Copied into each stream's settings when the stream registers.
-    [ "next-stream", [ "streaming.audioBitsPerSecond", "streaming.ffmpegVideoEncoder", "streaming.frameRate", "streaming.videoBitsPerSecond",
-      "streaming.videoEncoder" ] ],
+    [ "next-stream", [ "streaming.audioBitsPerSecond", "streaming.ffmpegAudioAdvanceMs", "streaming.ffmpegVideoEncoder", "streaming.frameRate",
+      "streaming.videoBitsPerSecond", "streaming.videoEncoder" ] ],
 
     // The preroll is encoded once at boot from them.
     [ "restart", [ "streaming.captureCodecs", "streaming.captureMode", "streaming.qualityPreset" ] ],

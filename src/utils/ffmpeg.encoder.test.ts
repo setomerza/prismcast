@@ -101,6 +101,9 @@ describe("buildEncoderFFmpegArgs with a grab region", () => {
 
     assert.ok(grabInput > 0, "the region is the first input");
     assert.equal(valueOf(args, "-f"), "x11grab");
+    assert.equal(valueOf(args, "-probesize"), "32");
+    assert.equal(valueOf(args, "-fpsprobesize"), "0");
+    assert.ok(args.indexOf("-fpsprobesize") < grabInput, "probe limit belongs to the screen input");
     assert.equal(valueOf(args, "-draw_mouse"), "0");
     assert.equal(valueOf(args, "-framerate"), "30");
     assert.equal(valueOf(args, "-video_size"), "1280x720");
