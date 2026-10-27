@@ -2,15 +2,16 @@
  *
  * video.test.ts: Unit tests for the testable helpers in video.ts. The module's broader API drives Puppeteer pages through page.click, page.waitForSelector,
  * page.goto, and the fullscreen sequence - those paths are deferred to e2e. The unit tests here cover buildVideoSelectorType (a pure profile->string mapper), the
- * evaluate-backed helpers that route through evaluateWithAbort with no other browser interaction (getVideoState, enforceVideoVolume, validateVideoElement,
- * checkVideoPresence, reloadVideoSource, startVideoPlayback, applyVideoStyles, lockVolumeProperties, verifyFullscreen), and the injection helpers that register their
+ * evaluate-backed helpers that route through evaluateWithAbort with no other browser interaction (getVideoState, enforceVideoVolume, capPlayerQuality,
+ * validateVideoElement, checkVideoPresence, reloadVideoSource, startVideoPlayback, applyVideoStyles, lockVolumeProperties, verifyFullscreen), and the injection
+ * helpers that register their
  * in-page scripts via page.evaluateOnNewDocument (injectVideoSelector, and suppressPageAudio, which also runs an immediate page.evaluate to mute existing videos).
  * Each helper is exercised against a stub context whose evaluate() returns a configurable value or throws, so the helper's argument-passing and result-handling
  * contracts are locked without spinning up Chrome.
  */
 import type { Frame, Page } from "puppeteer-core";
-import { applyVideoStyles, buildVideoSelectorType, checkVideoPresence, enforceVideoVolume, getVideoState, injectVideoSelector, lockVolumeProperties,
-  reloadVideoSource, startVideoPlayback, suppressPageAudio, validateVideoElement, verifyFullscreen } from "./video.ts";
+import { applyVideoStyles, buildVideoSelectorType, capPlayerQuality, checkVideoPresence, enforceVideoVolume, getVideoState, injectVideoSelector,
+  lockVolumeProperties, reloadVideoSource, startVideoPlayback, suppressPageAudio, validateVideoElement, verifyFullscreen } from "./video.ts";
 import { describe, test } from "node:test";
 import { seedVideoSelector, withDocument } from "../testing.helpers.ts";
 import type { Window } from "happy-dom";
@@ -259,6 +260,106 @@ describe("enforceVideoVolume", () => {
     });
 
     await assert.rejects(() => enforceVideoVolume(context, "selectReadyVideo"), /synthetic evaluate failure/, "error propagates");
+  });
+});
+
+/* The in-page callback capPlayerQuality hands to evaluate, and DISH Anywhere's Bitmovin ladder as the live player reported it: three 720p rungs, one of them
+ * 59.94 fps, under two 1080p rungs. The player stand-in records what it was told to select.
+ */
+type CapCallback = (type: string, maxHeight: number, maxFrameRate: number) => string | null;
+
+const DISH_LADDER = [
+  { bitrate: 319000, frameRate: 29.97, height: 288, id: "vid01", width: 512 },
+  { bitrate: 2867000, frameRate: 29.97, height: 720, id: "vid04", width: 1280 },
+  { bitrate: 4301000, frameRate: 29.97, height: 720, id: "vid05", width: 1280 },
+  { bitrate: 5632000, frameRate: 29.97, height: 1080, id: "vid06", width: 1920 },
+  { bitrate: 5637000, frameRate: 59.94, height: 720, id: "vid07", width: 1280 },
+  { bitrate: 7168000, frameRate: 59.94, height: 1080, id: "vid08", width: 1920 }
+];
+
+/* A Bitmovin-shaped player on the DISH ladder, starting on the given rendition, whose setVideoQuality calls are recorded in order. */
+function makeQualityPlayer(current: string): { player: object; selected: string[] } {
+
+  const selected: string[] = [];
+
+  return {
+
+    player: {
+
+      getAvailableVideoQualities: (): typeof DISH_LADDER => DISH_LADDER,
+      getVideoQuality: (): { id: string } => ({ id: selected.at(-1) ?? current }),
+      setVideoQuality: (id: string): void => { selected.push(id); }
+    },
+    selected
+  };
+}
+
+/* Runs the cap callback against a video inside a container that carries the player instance as a property, which is how DISH Anywhere's page keeps it.
+ */
+async function capWithPlayer(player: object | null, maxHeight: number, maxFrameRate: number): Promise<string | null> {
+
+  const callback = await captureCallback<CapCallback>(async (context) => capPlayerQuality(context, "selectFirstVideo", { frameRate: maxFrameRate, height: maxHeight }));
+
+  return withDocument("<div id=\"player\"><div><video id=\"v\"></video></div></div>", (window) => {
+
+    const container = window.document.getElementById("player") as unknown as Record<string, unknown>;
+
+    if(player) {
+
+      container["player"] = player;
+    }
+
+    seedVideoSelector(window, window.document.getElementById("v"));
+
+    return callback("selectFirstVideo", maxHeight, maxFrameRate);
+  });
+}
+
+describe("capPlayerQuality", () => {
+
+  test("forwards the selector type and the capture surface to evaluate", async () => {
+
+    const { context, stub } = makeContextStub(() => null);
+
+    assert.equal(await capPlayerQuality(context, "selectReadyVideo", { frameRate: 60, height: 720 }), null);
+    assert.deepEqual(stub.calls[0]?.args, [ "selectReadyVideo", 720, 60 ], "selector, height and frame rate forwarded");
+  });
+
+  test("selects 720p60 for a 720p 60 fps capture of the DISH ladder", async () => {
+
+    const { player, selected } = makeQualityPlayer("auto");
+
+    assert.equal(await capWithPlayer(player, 720, 60), "1280x720@59.94");
+    assert.deepEqual(selected, ["vid07"]);
+  });
+
+  test("prefers the higher-bitrate 720p30 rung for a 30 fps capture", async () => {
+
+    const { player, selected } = makeQualityPlayer("auto");
+
+    assert.equal(await capWithPlayer(player, 720, 30), "1280x720@29.97");
+    assert.deepEqual(selected, ["vid05"]);
+  });
+
+  test("leaves a player already on the chosen rendition alone", async () => {
+
+    const { player, selected } = makeQualityPlayer("vid07");
+
+    assert.equal(await capWithPlayer(player, 720, 60), null);
+    assert.deepEqual(selected, []);
+  });
+
+  test("leaves the page alone when no player instance is found", async () => {
+
+    assert.equal(await capWithPlayer(null, 720, 60), null);
+  });
+
+  test("leaves the player alone when nothing in the ladder fits the surface", async () => {
+
+    const { player, selected } = makeQualityPlayer("auto");
+
+    assert.equal(await capWithPlayer(player, 240, 60), null);
+    assert.deepEqual(selected, []);
   });
 });
 

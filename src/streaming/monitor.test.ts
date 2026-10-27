@@ -334,7 +334,7 @@ describe("monitorPlaybackHealth", () => {
     emitStreamRemoved(numericStreamId);
   });
 
-  test("reports the source's own size beside the surface capture encodes at", async () => {
+  test("reports the source's own size beside the surface capture encodes at", async (t) => {
 
     /* The pair is the point: the surface comes from the configured preset and the source size from the tick's own reading, so an operator can see a 720p source
      * being captured at 1080p. The fixture makes the two values differ - a 1920x1080 reading under the default 720p preset - so a swap or a cross-derivation
@@ -357,12 +357,24 @@ describe("monitorPlaybackHealth", () => {
       }
     });
 
+    const infos: unknown[][] = [];
+
+    t.mock.method(LOG, "info", (...args: unknown[]) => { infos.push(args); });
+
     const fake = makeFakePage({ clock });
     const handle = startMonitor(fake.page, "resolution-report-1", numericStreamId, clock);
 
     await advance(clock, MONITOR_INTERVAL);
     fake.evaluations[0]?.resolve({ ...readableState(1), videoHeight: 1080, videoWidth: 1920 });
     await flushMicrotasks();
+
+    // A source taller than the surface has the tick hold the player to a rendition that fits before it reports.
+    assert.equal(fake.evaluations.length, 2, "the taller source asked the page to cap its rendition");
+    assert.equal(fake.evaluations[1]?.args.at(-2), 720, "the cap is the surface's height");
+    fake.evaluations[1].resolve("1280x720@59.94");
+    await flushMicrotasks();
+
+    assert.deepEqual(infos, [[ "Holding the player to the %s rendition that fits the capture.", "1280x720@59.94" ]], "the change is logged");
 
     const reported = payloads.at(-1);
 

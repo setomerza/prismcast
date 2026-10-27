@@ -15,8 +15,8 @@ import { RECOVERY_METHODS, TINY_SEGMENT_EVIDENCE_SECONDS, checkCircuitBreaker, c
 import type { StreamHealthStatus, StreamStatus } from "./statusEmitter.ts";
 import { applyNativeQualityRefresh, getLastSegmentHasVideo, getLastSegmentSize, getStream, getStreamMemoryUsage, getStreamSegmenter, isCaptureIdentity,
   isHardwareAccelerated, makePendingCaptureIdentity } from "./registry.ts";
-import { applyVideoStyles, buildVideoSelectorType, checkVideoPresence, enforceVideoVolume, ensurePlayback, findVideoContext, getVideoState, tuneToChannel,
-  validateVideoElement, verifyFullscreen } from "../browser/video.ts";
+import { applyVideoStyles, buildVideoSelectorType, capPlayerQuality, checkVideoPresence, enforceVideoVolume, ensurePlayback, findVideoContext, getVideoState,
+  tuneToChannel, validateVideoElement, verifyFullscreen } from "../browser/video.ts";
 import { getCaptureImpairment, reaffirmCaptureSurface, syncWindowVisibility } from "../browser/index.ts";
 import { getEffectiveCaptureCodec, isCaptureHardwareAccelerated } from "./codec.ts";
 import { CONFIG } from "../config/index.ts";
@@ -2444,6 +2444,26 @@ export function monitorPlaybackHealth(
         if(state.muted || (state.volume < 1)) {
 
           await enforceVideoVolume(currentContext, selectorType);
+        }
+
+        /* Rendition cap. A player whose ABR has climbed past the capture surface is costing decode time for pixels the capture throws away, and Chrome pays for it in
+         * uneven frame pacing. The source's height is already in the reading, so the page is only asked when it is taller than the surface. Best-effort: a page that
+         * cannot answer is the stall and timeout checks' business, not this one's.
+         */
+        if(state.videoHeight > presetViewport.height) {
+
+          try {
+
+            const capped = await capPlayerQuality(currentContext, selectorType, { frameRate: streamInfo.settings.frameRate, height: presetViewport.height });
+
+            if(capped) {
+
+              LOG.info("Holding the player to the %s rendition that fits the capture.", capped);
+            }
+          } catch {
+
+            // The next tick tries again.
+          }
         }
 
         /* Stall detection. We compare currentTime to the previous check to determine if the video is progressing. The STALL_THRESHOLD (0.1 seconds) allows for minor

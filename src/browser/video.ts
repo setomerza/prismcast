@@ -215,6 +215,78 @@ export async function enforceVideoVolume(context: Frame | Page, selectorType: Vi
 }
 
 /**
+ * Holds the page's player to the best rendition the capture surface can show. A service's ABR sizes to the network, not the window, so DISH Anywhere's Bitmovin
+ * player climbs to 1080p60 for a 720p capture. Chrome decodes Widevine video in software, and the larger rendition costs enough that it presents frames unevenly,
+ * which the capture keeps as a picture that slows and speeds up. The best rendition that fits - tallest at or under the surface height, then the highest frame
+ * rate up to the capture's, then the highest bitrate - loses nothing the capture could have kept.
+ *
+ * The player is found as an object exposing the Bitmovin quality API on the video element or one of its ancestors, which is where players that keep their instance
+ * on their container leave it. A page with no such player, a ladder with nothing that fits, or a player already on the chosen rendition is left alone. Called on
+ * every monitor tick whose source is taller than the surface, so a page reload or a player that drops back to automatic selection is held again within a tick.
+ * @param context - The frame or page containing the video element.
+ * @param selectorType - The video selector type for finding the element.
+ * @param surface - The capture surface's height and frame rate.
+ * @returns The rendition selected, as "WxH@fps", or null when nothing was changed.
+ */
+export async function capPlayerQuality(context: Frame | Page, selectorType: VideoSelectorType, surface: { frameRate: number; height: number }):
+Promise<Nullable<string>> {
+
+  return evaluateWithAbort(context, (type: string, maxHeight: number, maxFrameRate: number): Nullable<string> => {
+
+    interface Quality { bitrate?: number; frameRate?: number; height?: number; id: string; width?: number }
+    interface QualityPlayer { getAvailableVideoQualities: () => Quality[]; getVideoQuality: () => { id: string }; setVideoQuality: (id: string) => void }
+
+    const isPlayer = (value: unknown): value is QualityPlayer => !!value && (typeof value === "object") &&
+      (typeof (value as Partial<QualityPlayer>).getAvailableVideoQualities === "function") && (typeof (value as Partial<QualityPlayer>).setVideoQuality === "function") &&
+      (typeof (value as Partial<QualityPlayer>).getVideoQuality === "function");
+
+    let player: Nullable<QualityPlayer> = null;
+
+    for(let depth = 0, element: Nullable<Element> = window.__prismcastSelectVideo?.(type) ?? null; element && !player && (depth < 12);
+      depth++, element = element.parentElement) {
+
+      for(const key of Object.keys(element)) {
+
+        const value = (element as unknown as Record<string, unknown>)[key];
+
+        if(isPlayer(value)) {
+
+          player = value;
+
+          break;
+        }
+      }
+    }
+
+    if(!player) {
+
+      return null;
+    }
+
+    try {
+
+      // A frame rate within a percent of the capture's fits it: 59.94 fills a 60 fps capture.
+      const fits = player.getAvailableVideoQualities().filter((q) => ((q.height ?? 0) > 0) && ((q.height ?? 0) <= maxHeight) &&
+        (!q.frameRate || (q.frameRate <= (maxFrameRate * 1.01))));
+
+      const best = fits.sort((a, b) => ((b.height ?? 0) - (a.height ?? 0)) || ((b.frameRate ?? 0) - (a.frameRate ?? 0)) || ((b.bitrate ?? 0) - (a.bitrate ?? 0)))[0];
+
+      if(!best || (player.getVideoQuality().id === best.id)) {
+
+        return null;
+      }
+
+      player.setVideoQuality(best.id);
+
+      return String(best.width ?? 0) + "x" + String(best.height) + "@" + String(best.frameRate ?? "?");
+    } catch {
+
+      return null;
+    }
+  }, [ selectorType, surface.height, surface.frameRate ]);
+}
+
+/**
  * Mutes every video element currently on the page, silencing audio that does not belong to the channel being established. A multi-channel page auto-plays a
  * default livestream on load (Hulu's /live, for example), and with a capture pipeline already running that audio bleeds into the stream until channel selection
  * reaches the requested channel; a page reloaded to re-establish a channel meets the same default again. Two moments call for it: where a tune begins, and where
