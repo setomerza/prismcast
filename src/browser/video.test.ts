@@ -2,16 +2,15 @@
  *
  * video.test.ts: Unit tests for the testable helpers in video.ts. The module's broader API drives Puppeteer pages through page.click, page.waitForSelector,
  * page.goto, and the fullscreen sequence - those paths are deferred to e2e. The unit tests here cover buildVideoSelectorType (a pure profile->string mapper), the
- * evaluate-backed helpers that route through evaluateWithAbort with no other browser interaction (getVideoState, enforceVideoVolume, capPlayerQuality,
- * validateVideoElement, checkVideoPresence, reloadVideoSource, startVideoPlayback, applyVideoStyles, lockVolumeProperties, verifyFullscreen), and the injection
- * helpers that register their
+ * evaluate-backed helpers that route through evaluateWithAbort with no other browser interaction (getVideoState, enforceVideoVolume, validateVideoElement,
+ * checkVideoPresence, reloadVideoSource, startVideoPlayback, applyVideoStyles, lockVolumeProperties, verifyFullscreen), and the injection helpers that register their
  * in-page scripts via page.evaluateOnNewDocument (injectVideoSelector, and suppressPageAudio, which also runs an immediate page.evaluate to mute existing videos).
  * Each helper is exercised against a stub context whose evaluate() returns a configurable value or throws, so the helper's argument-passing and result-handling
  * contracts are locked without spinning up Chrome.
  */
 import type { Frame, Page } from "puppeteer-core";
-import { applyVideoStyles, buildVideoSelectorType, capPlayerQuality, checkVideoPresence, enforceVideoVolume, getVideoState, injectVideoSelector,
-  lockVolumeProperties, reloadVideoSource, startVideoPlayback, suppressPageAudio, validateVideoElement, verifyFullscreen } from "./video.ts";
+import { applyVideoStyles, buildVideoSelectorType, checkVideoPresence, enforceVideoVolume, getVideoState, injectVideoSelector, lockVolumeProperties,
+  reloadVideoSource, startVideoPlayback, suppressPageAudio, validateVideoElement, verifyFullscreen } from "./video.ts";
 import { describe, test } from "node:test";
 import { seedVideoSelector, withDocument } from "../testing.helpers.ts";
 import type { Window } from "happy-dom";
@@ -263,10 +262,10 @@ describe("enforceVideoVolume", () => {
   });
 });
 
-/* The in-page callback capPlayerQuality hands to evaluate, and DISH Anywhere's Bitmovin ladder as the live player reported it: three 720p rungs, one of them
- * 59.94 fps, under two 1080p rungs. The player stand-in records what it was told to select.
+/* The in-page callback getVideoState hands to evaluate when it is given a capture surface, and DISH Anywhere's Bitmovin ladder as the live player reported it:
+ * three 720p rungs, one of them 59.94 fps, under two 1080p rungs. The player stand-in records what it was told to select.
  */
-type CapCallback = (type: string, maxHeight: number, maxFrameRate: number) => string | null;
+type StateCallback = (type: string, maxHeight?: number, maxFrameRate?: number) => { capped?: string; videoHeight: number } | null;
 
 const DISH_LADDER = [
   { bitrate: 319000, frameRate: 29.97, height: 288, id: "vid01", width: 512 },
@@ -294,71 +293,83 @@ function makeQualityPlayer(current: string): { player: object; selected: string[
   };
 }
 
-/* Runs the cap callback against a video inside a container that carries the player instance as a property, which is how DISH Anywhere's page keeps it.
+/* Runs the state read against a video inside a container that carries the player instance as a property, which is how DISH Anywhere's page keeps it. A null
+ * surface reads without a cap.
  */
-async function capWithPlayer(player: object | null, maxHeight: number, maxFrameRate: number): Promise<string | null> {
+async function readWithPlayer(player: object | null, surface: { frameRate: number; height: number } | null): Promise<string | undefined> {
 
-  const callback = await captureCallback<CapCallback>(async (context) => capPlayerQuality(context, "selectFirstVideo", { frameRate: maxFrameRate, height: maxHeight }));
+  const callback = await captureCallback<StateCallback>(async (context) => getVideoState(context, "selectFirstVideo", surface ? { cap: surface } : {}));
 
   return withDocument("<div id=\"player\"><div><video id=\"v\"></video></div></div>", (window) => {
 
-    const container = window.document.getElementById("player") as unknown as Record<string, unknown>;
-
     if(player) {
 
-      container["player"] = player;
+      (window.document.getElementById("player") as unknown as Record<string, unknown>)["player"] = player;
     }
 
     seedVideoSelector(window, window.document.getElementById("v"));
 
-    return callback("selectFirstVideo", maxHeight, maxFrameRate);
+    const state = surface ? callback("selectFirstVideo", surface.height, surface.frameRate) : callback("selectFirstVideo");
+
+    assert.ok(state, "the video was read");
+
+    return state.capped;
   });
 }
 
-describe("capPlayerQuality", () => {
+describe("getVideoState with a capture surface", () => {
 
-  test("forwards the selector type and the capture surface to evaluate", async () => {
+  test("forwards the surface after the selector type", async () => {
 
     const { context, stub } = makeContextStub(() => null);
 
-    assert.equal(await capPlayerQuality(context, "selectReadyVideo", { frameRate: 60, height: 720 }), null);
-    assert.deepEqual(stub.calls[0]?.args, [ "selectReadyVideo", 720, 60 ], "selector, height and frame rate forwarded");
+    await getVideoState(context, "selectReadyVideo", { cap: { frameRate: 30, height: 720 } });
+
+    assert.deepEqual(stub.calls[0]?.args, [ "selectReadyVideo", 720, 30 ], "selector, height and frame rate forwarded");
   });
 
-  test("selects 720p60 for a 720p 60 fps capture of the DISH ladder", async () => {
+  test("holds a 720p 30 fps capture to the higher-bitrate 720p30 rung", async () => {
 
     const { player, selected } = makeQualityPlayer("auto");
 
-    assert.equal(await capWithPlayer(player, 720, 60), "1280x720@59.94");
-    assert.deepEqual(selected, ["vid07"]);
-  });
-
-  test("prefers the higher-bitrate 720p30 rung for a 30 fps capture", async () => {
-
-    const { player, selected } = makeQualityPlayer("auto");
-
-    assert.equal(await capWithPlayer(player, 720, 30), "1280x720@29.97");
+    assert.equal(await readWithPlayer(player, { frameRate: 30, height: 720 }), "1280x720@29.97");
     assert.deepEqual(selected, ["vid05"]);
+  });
+
+  test("holds a 720p 60 fps capture to 720p60", async () => {
+
+    const { player, selected } = makeQualityPlayer("auto");
+
+    assert.equal(await readWithPlayer(player, { frameRate: 60, height: 720 }), "1280x720@59.94");
+    assert.deepEqual(selected, ["vid07"]);
   });
 
   test("leaves a player already on the chosen rendition alone", async () => {
 
-    const { player, selected } = makeQualityPlayer("vid07");
+    const { player, selected } = makeQualityPlayer("vid05");
 
-    assert.equal(await capWithPlayer(player, 720, 60), null);
+    assert.equal(await readWithPlayer(player, { frameRate: 30, height: 720 }), undefined);
     assert.deepEqual(selected, []);
   });
 
-  test("leaves the page alone when no player instance is found", async () => {
+  test("leaves the player alone without a surface", async () => {
 
-    assert.equal(await capWithPlayer(null, 720, 60), null);
+    const { player, selected } = makeQualityPlayer("auto");
+
+    assert.equal(await readWithPlayer(player, null), undefined);
+    assert.deepEqual(selected, []);
+  });
+
+  test("reads the video when no player instance is found", async () => {
+
+    assert.equal(await readWithPlayer(null, { frameRate: 30, height: 720 }), undefined);
   });
 
   test("leaves the player alone when nothing in the ladder fits the surface", async () => {
 
     const { player, selected } = makeQualityPlayer("auto");
 
-    assert.equal(await capWithPlayer(player, 240, 60), null);
+    assert.equal(await readWithPlayer(player, { frameRate: 30, height: 240 }), undefined);
     assert.deepEqual(selected, []);
   });
 });

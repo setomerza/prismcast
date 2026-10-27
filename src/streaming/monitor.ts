@@ -15,7 +15,7 @@ import { RECOVERY_METHODS, TINY_SEGMENT_EVIDENCE_SECONDS, checkCircuitBreaker, c
 import type { StreamHealthStatus, StreamStatus } from "./statusEmitter.ts";
 import { applyNativeQualityRefresh, getLastSegmentHasVideo, getLastSegmentSize, getStream, getStreamMemoryUsage, getStreamSegmenter, isCaptureIdentity,
   isHardwareAccelerated, makePendingCaptureIdentity } from "./registry.ts";
-import { applyVideoStyles, buildVideoSelectorType, capPlayerQuality, checkVideoPresence, enforceVideoVolume, ensurePlayback, findVideoContext, getVideoState,
+import { applyVideoStyles, buildVideoSelectorType, checkVideoPresence, enforceVideoVolume, ensurePlayback, findVideoContext, getVideoState,
   tuneToChannel, validateVideoElement, verifyFullscreen } from "../browser/video.ts";
 import { getCaptureImpairment, reaffirmCaptureSurface, syncWindowVisibility } from "../browser/index.ts";
 import { getEffectiveCaptureCodec, isCaptureHardwareAccelerated } from "./codec.ts";
@@ -2372,8 +2372,9 @@ export function monitorPlaybackHealth(
 
           // A read issued while a timeout streak is open is a confirmation probe, so it carries the short bound. With no streak open the read takes the evaluate
           // wrapper's default, which is the bound that detects a hung tab in the first place.
-          stateInfo = await getVideoState(currentContext, selectorType,
-            { clock: deps.clock, timeoutMs: (consecutiveTimeouts > 0) ? UNRESPONSIVE_PROBE_TIMEOUT : undefined });
+          // The read also holds the page's player to the rendition the capture surface can show (see getVideoState).
+          stateInfo = await getVideoState(currentContext, selectorType, { cap: { frameRate: streamInfo.settings.frameRate, height: presetViewport.height },
+            clock: deps.clock, timeoutMs: (consecutiveTimeouts > 0) ? UNRESPONSIVE_PROBE_TIMEOUT : undefined });
         } catch(stateError) {
 
           // Classify through the shared page-death predicate: the world the read ran in is gone, so the video may simply live in a context we no longer hold.
@@ -2438,32 +2439,17 @@ export function monitorPlaybackHealth(
         consecutiveTimeouts = 0;
         lastVideoState = state;
 
+        if(state.capped) {
+
+          LOG.info("Holding the player to the %s rendition that fits the capture.", state.capped);
+        }
+
         /* Volume enforcement. Some sites aggressively mute videos (e.g., France24 mutes on page visibility change, some sites mute for ads). We restore volume on
          * every check to ensure audio is captured.
          */
         if(state.muted || (state.volume < 1)) {
 
           await enforceVideoVolume(currentContext, selectorType);
-        }
-
-        /* Rendition cap. A player whose ABR has climbed past the capture surface is costing decode time for pixels the capture throws away, and Chrome pays for it in
-         * uneven frame pacing. The source's height is already in the reading, so the page is only asked when it is taller than the surface. Best-effort: a page that
-         * cannot answer is the stall and timeout checks' business, not this one's.
-         */
-        if(state.videoHeight > presetViewport.height) {
-
-          try {
-
-            const capped = await capPlayerQuality(currentContext, selectorType, { frameRate: streamInfo.settings.frameRate, height: presetViewport.height });
-
-            if(capped) {
-
-              LOG.info("Holding the player to the %s rendition that fits the capture.", capped);
-            }
-          } catch {
-
-            // The next tick tries again.
-          }
         }
 
         /* Stall detection. We compare currentTime to the previous check to determine if the video is progressing. The STALL_THRESHOLD (0.1 seconds) allows for minor

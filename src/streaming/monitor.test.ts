@@ -365,16 +365,11 @@ describe("monitorPlaybackHealth", () => {
     const handle = startMonitor(fake.page, "resolution-report-1", numericStreamId, clock);
 
     await advance(clock, MONITOR_INTERVAL);
-    fake.evaluations[0]?.resolve({ ...readableState(1), videoHeight: 1080, videoWidth: 1920 });
+    fake.evaluations[0]?.resolve({ ...readableState(1), capped: "1280x720@29.97", videoHeight: 1080, videoWidth: 1920 });
     await flushMicrotasks();
 
-    // A source taller than the surface has the tick hold the player to a rendition that fits before it reports.
-    assert.equal(fake.evaluations.length, 2, "the taller source asked the page to cap its rendition");
-    assert.equal(fake.evaluations[1]?.args.at(-2), 720, "the cap is the surface's height");
-    fake.evaluations[1].resolve("1280x720@59.94");
-    await flushMicrotasks();
-
-    assert.deepEqual(infos, [[ "Holding the player to the %s rendition that fits the capture.", "1280x720@59.94" ]], "the change is logged");
+    // The read held the player to a rendition that fits, and the tick says so.
+    assert.deepEqual(infos, [[ "Holding the player to the %s rendition that fits the capture.", "1280x720@29.97" ]], "the change is logged");
 
     const reported = payloads.at(-1);
 

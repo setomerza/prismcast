@@ -75,6 +75,9 @@ export interface VideoState {
 
   // Current volume level from 0.0 (silent) to 1.0 (full volume). The health monitor enforces volume = 1.0 on each check to counter sites that lower volume.
   volume: number;
+
+  // The rendition this read switched the page's player to, as "WxH@fps", when the read held the player to the capture surface and had to change it.
+  capped?: string;
 }
 
 /**
