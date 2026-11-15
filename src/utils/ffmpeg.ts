@@ -593,6 +593,9 @@ export interface EncoderFFmpegOptions {
   // Frames between keyframes. The segmenter cuts at keyframes, so this is the segment duration in frames.
   readonly keyframeInterval: number;
   readonly platform?: NodeJS.Platform;
+
+  // Whether a grab is oversampled and re-timed (buildGrabSmoothingFilter). Defaults to true; FFMPEG_GRAB_SMOOTHING=0 turns it off.
+  readonly smoothGrab?: boolean;
   readonly videoBitrate: number;
   readonly width: number;
 }
@@ -660,6 +663,45 @@ export function buildVideoEncoderArgs(encoder: FFmpegVideoEncoder, videoBitrate:
 }
 
 /**
+ * Whether a grab at this frame rate is smoothed: the grab runs at twice the rate, so up to 30 fps (a 60 fps grab).
+ * @param options - The encoder options.
+ * @returns True when the grab is oversampled and re-timed.
+ */
+export function isGrabSmoothed(options: Pick<EncoderFFmpegOptions, "frameRate" | "grab" | "smoothGrab">): boolean {
+
+  return !!options.grab && (options.smoothGrab !== false) && (options.frameRate <= 30);
+}
+
+/**
+ * Builds the filter that turns a grab at twice the frame rate into an even stream at the source's NTSC rate (frameRate x 1000/1001, 29.97 for 30).
+ *
+ * A grab at the frame rate samples the screen on FFmpeg's clock while Chrome presents the video's frames on its own, unevenly under load. When a sample lands near
+ * the moment a frame changes, it catches the old frame one time and misses the new one the next: a repeated frame followed by a skipped one, seen as a hitch in
+ * steady motion such as a news ticker (2026-11-15: 505 repeats and 500 skips in two minutes of a test pattern on merzabox). Grabbing at twice the rate catches
+ * every frame Chrome shows for at least one grab interval. Then:
+ *
+ * - mpdecimate drops the grabs that repeat the previous one exactly, leaving each frame once, stamped with the grab that first saw it;
+ * - setpts smooths those stamps: each frame lands one frame duration after the previous output plus a tenth of its error, so the grab interval's jitter is
+ *   averaged out while the clock is still followed. A frame more than 40 ms off (after a still picture, or a frame Chrome never drew) is taken at its own stamp;
+ * - fps re-times to the output rate, with the first frame's stamp as its origin, so frames sit mid-slot, far from the boundaries where jitter decides.
+ *
+ * On a Chrome/Xvfb bench with every core busy this cut repeats and skips from 161 and 153 a minute to 52 and 40; most of what is left are frames Chrome dropped.
+ * @param frameRate - The configured frame rate; the output is frameRate x 1000/1001.
+ * @returns The -vf argument.
+ */
+export function buildGrabSmoothingFilter(frameRate: number): string {
+
+  const duration = "1001/" + String(frameRate * 1000) + "/TB";
+  const error = "(PTS-PREV_OUTPTS-" + duration + ")";
+
+  return [ "format=yuv420p",
+    // Grabs of an unchanged screen are bit-identical; any block that differs keeps the frame.
+    "mpdecimate=hi=128:lo=64:frac=0",
+    "setpts='if(isnan(PREV_OUTPTS),PTS,if(gt(abs" + error + ",0.04/TB),PTS,PREV_OUTPTS+" + duration + "+0.1*" + error + "))'",
+    "fps=" + String(frameRate * 1000) + "/1001" ].join(",");
+}
+
+/**
  * Builds the argv for an encoder FFmpeg: raw video on stdin, raw audio on fd 3, fragmented MP4 on stdout with the same flags the remux path uses.
  * @param options - The encoder's input geometry, rate, and output settings.
  * @returns The FFmpeg argv array (excluding the binary itself).
@@ -679,8 +721,11 @@ export function buildEncoderFFmpegArgs(options: EncoderFFmpegOptions): string[] 
 
   // The video input: the stream's region of the X display, grabbed at the frame rate without the pointer, or raw yuv420p frames on stdin that the pump paces to
   // exactly frameRate per second. The screen device already knows its geometry and rate; do not wait for an FPS probe before opening audio.
+  // A smoothed grab samples the screen at twice the frame rate (buildGrabSmoothingFilter).
+  const smoothed = isGrabSmoothed(options);
+  const grabRate = smoothed ? options.frameRate * 2 : options.frameRate;
   const videoInput = options.grab ?
-    [ ...rawInput, "-fpsprobesize", "0", "-f", "x11grab", "-draw_mouse", "0", "-framerate", String(options.frameRate), "-video_size", videoSize, "-i",
+    [ ...rawInput, "-fpsprobesize", "0", "-f", "x11grab", "-draw_mouse", "0", "-framerate", String(grabRate), "-video_size", videoSize, "-i",
       x11GrabInput(options.grab) ] :
     [ ...rawInput, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-video_size", videoSize, "-framerate", String(options.frameRate), "-i", "pipe:0" ];
 
@@ -699,6 +744,7 @@ export function buildEncoderFFmpegArgs(options: EncoderFFmpegOptions): string[] 
     "-i", "pipe:3",
     "-map", "0:v",
     "-map", "1:a",
+    ...(smoothed ? [ "-vf", buildGrabSmoothingFilter(options.frameRate) ] : []),
     ...buildVideoEncoderArgs(options.encoder, options.videoBitrate, options.keyframeInterval),
     /* The MP4 output takes the encoder's SPS and PPS as global headers, so by default they appear only in the init segment. The preroll ahead of a slow tune is
      * Constrained Baseline under its own init, and an FFmpeg-based HLS client that remuxes across that discontinuity keeps the preroll's parameter sets and

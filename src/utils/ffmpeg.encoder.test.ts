@@ -3,7 +3,8 @@
  * ffmpeg.encoder.test.ts: Tests for the FFmpeg encoder mode's pure pieces: the argv builders, the encoder check, and the search for an FFmpeg that can actually
  * encode. The search runs over a context literal, so no FFmpeg is spawned.
  */
-import { buildEncoderFFmpegArgs, buildEncoderProbeArgs, buildVideoEncoderArgs, isFFmpegVideoEncoder, probeEncoderFFmpegPath, x11GrabInput } from "./ffmpeg.ts";
+import { buildEncoderFFmpegArgs, buildEncoderProbeArgs, buildGrabSmoothingFilter, buildVideoEncoderArgs, isFFmpegVideoEncoder, isGrabSmoothed, probeEncoderFFmpegPath,
+  x11GrabInput } from "./ffmpeg.ts";
 import { describe, test } from "node:test";
 import type { EncoderFFmpegOptions } from "./ffmpeg.ts";
 import assert from "node:assert/strict";
@@ -105,13 +106,42 @@ describe("buildEncoderFFmpegArgs with a grab region", () => {
     assert.equal(valueOf(args, "-fpsprobesize"), "0");
     assert.ok(args.indexOf("-fpsprobesize") < grabInput, "probe limit belongs to the screen input");
     assert.equal(valueOf(args, "-draw_mouse"), "0");
-    assert.equal(valueOf(args, "-framerate"), "30");
+    assert.equal(valueOf(args, "-framerate"), "60", "a smoothed grab samples at twice the frame rate");
     assert.equal(valueOf(args, "-video_size"), "1280x720");
     assert.ok(!args.includes("pipe:0"), "nothing is read from stdin");
     assert.ok(!args.includes("rawvideo"), "no raw video input");
     assert.ok(args.indexOf("pipe:3") > grabInput, "the audio is the second input");
     assert.equal(valueOf(args, "-c:v"), "h264_nvenc");
     assert.equal(args.at(-1), "pipe:1");
+  });
+
+  test("smooths the grab: drops repeated grabs, evens their stamps, and re-times to 29.97 before the encoder", () => {
+
+    const args = buildEncoderFFmpegArgs({ ...OPTIONS, grab: { display: ":99", x: 0, y: 0 } });
+    const filter = valueOf(args, "-vf") ?? "";
+
+    assert.equal(filter, buildGrabSmoothingFilter(30));
+    assert.ok((args.indexOf("-vf") > args.indexOf("pipe:3")) && (args.indexOf("-vf") < args.indexOf("-c:v")), "an output filter, ahead of the encoder");
+    assert.ok(filter.startsWith("format=yuv420p,mpdecimate=hi=128:lo=64:frac=0,setpts='"), "repeats are dropped before the stamps are smoothed");
+    assert.ok(filter.endsWith("',fps=30000/1001"), "the output is the NTSC rate");
+    assert.ok(filter.includes("1001/30000/TB"), "the smoothing step is one output frame");
+    assert.equal(filter.split("'").length, 3, "the expression's commas are protected by one pair of quotes");
+  });
+
+  test("grabs at the frame rate with no filter when smoothing is off, above 30 fps, or without a grab", () => {
+
+    const grab = { display: ":99", x: 0, y: 0 };
+
+    for(const options of [ { ...OPTIONS, grab, smoothGrab: false }, { ...OPTIONS, frameRate: 60, grab } ]) {
+
+      const args = buildEncoderFFmpegArgs(options);
+
+      assert.equal(valueOf(args, "-framerate"), String(options.frameRate));
+      assert.ok(!args.includes("-vf"));
+    }
+
+    assert.ok(!buildEncoderFFmpegArgs(OPTIONS).includes("-vf"), "raw frames from the pump are already paced");
+    assert.equal(isGrabSmoothed(OPTIONS), false);
   });
 
   test("names the screen for a bare display and keeps one that already has it", () => {

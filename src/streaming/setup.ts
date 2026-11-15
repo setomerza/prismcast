@@ -909,6 +909,7 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
             grab: { display: process.env["DISPLAY"] ?? ":99", x: rect.x, y: rect.y },
             height: rect.height,
             keyframeInterval: Math.max(1, Math.round(settings.frameRate * settings.segmentDuration)),
+            smoothGrab: process.env["FFMPEG_GRAB_SMOOTHING"] !== "0",
             videoBitrate: settings.videoBitsPerSecond,
             width: rect.width
           }, onProcessError, streamId);
