@@ -31,6 +31,7 @@ import { cleanupIdleStreams } from "./streaming/hls.ts";
 import compression from "compression";
 import express from "express";
 import { generatePreroll } from "./streaming/preroll.ts";
+import { getHighFrameRatePolicy } from "./streaming/highFrameRate.ts";
 import { initializeUserChannels } from "./config/userChannels.ts";
 import { initializeUserProfiles } from "./config/userProfiles.ts";
 import { installHealthBridge } from "./routes/config/channels/healthBridge.ts";
@@ -662,6 +663,9 @@ function startBackgroundServices(): void {
 
   startIdleCleanup();
   backgroundServices.defer(stopIdleCleanup);
+
+  // Read the high frame rate list now, so the first stream after a restart already sees it.
+  getHighFrameRatePolicy();
 
   startShowInfoPolling();
   backgroundServices.defer(stopShowInfoPolling);
