@@ -4,9 +4,9 @@
  *
  * A list of channel keys is read from HFR_CHANNELS_URL (a JSON document, {"generated": "<ISO time>", "channels": ["nflredzone", ...]}), which something
  * outside PrismCast keeps current - in merzatv, the guide container marks the channels carrying a live NFL game. A stream that starts on a listed channel while
- * no other stream runs at the higher rate gets HFR_FRAME_RATE (default 60) and at least HFR_VIDEO_BITRATE (default 12 Mbps); every other stream keeps the
- * configured settings. One at a time because Chrome decodes protected video in software and draws every capture window in one GPU process: one 720p60 stream
- * holds 60 distinct frames a second on merzabox, two fall to 30-35 each.
+ * fewer than HFR_MAX_STREAMS (default 1) other streams run at the higher rate gets HFR_FRAME_RATE (default 60) and at least HFR_VIDEO_BITRATE (default 12 Mbps);
+ * every other stream keeps the configured settings. The default is one because Chrome decodes protected video in software and draws every capture window in
+ * one GPU process: with x11grab, one 720p60 stream held 60 distinct frames a second on merzabox and two fell to 30-35 each.
  *
  * Without the variable, or when the list cannot be read or is older than LIST_MAX_AGE, nothing is listed and every stream runs as configured.
  */
@@ -24,6 +24,7 @@ export interface HighFrameRatePolicy {
 
   readonly channels: ReadonlySet<string>;
   readonly frameRate: number;
+  readonly maxStreams: number;
   readonly videoBitsPerSecond: number;
 }
 
@@ -58,8 +59,8 @@ export function parseHighFrameRateList(body: unknown, now: number): Set<string> 
 }
 
 /**
- * Applies the policy to a new stream's settings: the higher rate when its channel is listed, it would raise the rate, and no running stream already runs above
- * the configured rate.
+ * Applies the policy to a new stream's settings: the higher rate when its channel is listed, it would raise the rate, and fewer than maxStreams running streams
+ * already run above the configured rate.
  * @param settings - The new stream's settings, from the configuration.
  * @param channelName - The new stream's channel key.
  * @param running - The settings of the streams already running.
@@ -73,7 +74,7 @@ export function applyHighFrameRate(settings: StreamSettings, channelName: string
     return settings;
   }
 
-  if(running.some((other) => other.frameRate > settings.frameRate)) {
+  if(running.filter((other) => other.frameRate > settings.frameRate).length >= policy.maxStreams) {
 
     return settings;
   }
@@ -137,6 +138,7 @@ export function getHighFrameRatePolicy(): HighFrameRatePolicy {
 
     channels: listed,
     frameRate: Number(process.env["HFR_FRAME_RATE"] ?? "60") || 60,
+    maxStreams: Math.max(0, Math.floor(Number(process.env["HFR_MAX_STREAMS"] ?? "1"))) || 0,
     videoBitsPerSecond: Number(process.env["HFR_VIDEO_BITRATE"] ?? "12000000") || 12000000
   };
 }
