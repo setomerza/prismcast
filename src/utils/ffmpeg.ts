@@ -10,6 +10,7 @@ import type { ChildProcess } from "node:child_process";
 import type { Clock } from "homebridge-plugin-utils";
 import { LOG } from "./logger.ts";
 import type { Nullable } from "../types/index.ts";
+import { PassThrough } from "node:stream";
 import { join } from "node:path";
 import { memoizeAsync } from "./memo.ts";
 import { spawn } from "node:child_process";
@@ -583,6 +584,9 @@ export interface EncoderFFmpegOptions {
 
   readonly audioBitrate: number;
   readonly comment?: string;
+
+  // With a grab, the change-driven grabber (tools/dgrab) to read it through instead of x11grab: its path. FFMPEG_DAMAGE_GRAB names it. See buildDamageGrabArgs.
+  readonly damageGrab?: string;
   readonly encoder: FFmpegVideoEncoder;
   readonly frameRate: number;
   readonly height: number;
@@ -667,9 +671,35 @@ export function buildVideoEncoderArgs(encoder: FFmpegVideoEncoder, videoBitrate:
  * @param options - The encoder options.
  * @returns True when the grab is oversampled and re-timed.
  */
-export function isGrabSmoothed(options: Pick<EncoderFFmpegOptions, "frameRate" | "grab" | "smoothGrab">): boolean {
+export function isGrabSmoothed(options: Pick<EncoderFFmpegOptions, "damageGrab" | "frameRate" | "grab" | "smoothGrab">): boolean {
 
-  return !!options.grab && (options.smoothGrab !== false) && (options.frameRate <= 60);
+  return !!options.grab && !isDamageGrab(options) && (options.smoothGrab !== false) && (options.frameRate <= 60);
+}
+
+/**
+ * Whether a grab goes through the change-driven grabber rather than x11grab.
+ * @param options - The encoder options.
+ * @returns True when dgrab feeds FFmpeg's stdin.
+ */
+export function isDamageGrab(options: Pick<EncoderFFmpegOptions, "damageGrab" | "grab">): boolean {
+
+  return !!options.grab && !!options.damageGrab;
+}
+
+/**
+ * Builds the argv for dgrab (tools/dgrab/dgrab.c), the change-driven grabber: it copies the region once each time X reports a drawing in it, and writes raw bgr0
+ * frames at the source's NTSC rate (frameRate x 1000/1001), repeating the last frame when nothing new arrived. That replaces the smoothed grab's oversampling and
+ * CPU colour conversion: NVENC takes the bgr0 and converts on the GPU (BT.601, the same matrix the CPU path used), and each frame is grabbed right after Chrome
+ * draws it rather than at the nearest sample. On a Chrome/Xvfb bench (2026-11-17) it took half the CPU of the smoothed grab, with no repeated or skipped frames
+ * at 30 or 60 fps where the smoothed grab had a few.
+ * @param options - The encoder options; grab must be set.
+ * @returns The argv (excluding the binary itself).
+ */
+export function buildDamageGrabArgs(options: Pick<EncoderFFmpegOptions, "frameRate" | "grab" | "height" | "width">): string[] {
+
+  const grab = options.grab ?? { display: ":99", x: 0, y: 0 };
+
+  return [ grab.display, String(grab.x), String(grab.y), String(options.width), String(options.height), String(options.frameRate * 1000), "1001" ];
 }
 
 /**
@@ -726,17 +756,21 @@ export function buildEncoderFFmpegArgs(options: EncoderFFmpegOptions): string[] 
   // A smoothed grab samples the screen at twice the frame rate (buildGrabSmoothingFilter).
   const smoothed = isGrabSmoothed(options);
   const grabRate = smoothed ? options.frameRate * 2 : options.frameRate;
-  const videoInput = options.grab ?
-    [ ...rawInput, "-fpsprobesize", "0", "-f", "x11grab", "-draw_mouse", "0", "-framerate", String(grabRate), "-video_size", videoSize, "-i",
-      x11GrabInput(options.grab) ] :
-    [ ...rawInput, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-video_size", videoSize, "-framerate", String(options.frameRate), "-i", "pipe:0" ];
+  // A change-driven grab arrives on stdin as bgr0 at the NTSC rate (buildDamageGrabArgs).
+  const damage = isDamageGrab(options);
+  const videoInput = damage ?
+    [ ...rawInput, "-f", "rawvideo", "-pix_fmt", "bgr0", "-video_size", videoSize, "-framerate", String(options.frameRate * 1000) + "/1001", "-i", "pipe:0" ] :
+    options.grab ?
+      [ ...rawInput, "-fpsprobesize", "0", "-f", "x11grab", "-draw_mouse", "0", "-framerate", String(grabRate), "-video_size", videoSize, "-i",
+        x11GrabInput(options.grab) ] :
+      [ ...rawInput, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-video_size", videoSize, "-framerate", String(options.frameRate), "-i", "pipe:0" ];
 
   const ffmpegArgs = [
     "-hide_banner",
     "-nostats",
     "-loglevel", "warning",
     // A grabbing FFmpeg reads nothing from stdin, and without this it would read the pipe there for interactive commands.
-    ...(options.grab ? ["-nostdin"] : []),
+    ...((options.grab && !damage) ? ["-nostdin"] : []),
     ...videoInput,
     // Continuous 48 kHz stereo float audio, aligned by the pump to the video.
     ...rawInput,
@@ -793,9 +827,21 @@ export function buildEncoderProbeArgs(encoder: FFmpegVideoEncoder): string[] {
 export function spawnEncoderFFmpeg(ffmpegBin: string, options: EncoderFFmpegOptions, onError: (error: Error) => void,
   streamId?: string): EncoderFFmpegProcess {
 
-  const ffmpeg = spawn(ffmpegBin, buildEncoderFFmpegArgs(options), { stdio: [ "pipe", "pipe", "pipe", "pipe" ] });
-  const [ stdin, stdout, stderr, audioIn ] = ffmpeg.stdio as unknown as [ Writable, Readable, Readable, Writable ];
+  // A change-driven grab: dgrab's stdout is FFmpeg's stdin directly, so the frames never pass through Node.
+  const grabber = (isDamageGrab(options) && options.damageGrab) ? spawnDamageGrabber(options.damageGrab, buildDamageGrabArgs(options), streamId) : null;
+  const ffmpeg = spawn(ffmpegBin, buildEncoderFFmpegArgs(options), { stdio: [ grabber?.stdout ?? "pipe", "pipe", "pipe", "pipe" ] });
+  const [ ffmpegStdin, stdout, stderr, audioIn ] = ffmpeg.stdio as unknown as [ Nullable<Writable>, Readable, Readable, Writable ];
+
+  // With dgrab feeding FFmpeg nothing writes the video pipe here; callers still get a stream to attach their handlers to.
+  const stdin = ffmpegStdin ?? new PassThrough();
   const supervision = superviseFFmpeg({ ffmpeg, label: "FFmpeg encoder", onError, stderr, streamId });
+
+  if(grabber) {
+
+    // FFmpeg holds its own copy of the pipe now. When FFmpeg goes, so does the grabber.
+    grabber.stdout?.destroy();
+    ffmpeg.once("exit", () => grabber.kill("SIGTERM"));
+  }
 
   /* An FFmpeg blocked on one of its pipes does not act on SIGTERM until the read or write returns, so the kill also closes all three: a blocked read returns end of
    * input, a blocked write to a stdout nobody drains any more fails, and FFmpeg exits. The supervision's SIGKILL covers anything that still holds on.
@@ -803,12 +849,42 @@ export function spawnEncoderFFmpeg(ffmpegBin: string, options: EncoderFFmpegOpti
   const kill = (): void => {
 
     supervision.kill();
+    grabber?.kill("SIGTERM");
     stdin.destroy();
     audioIn.destroy();
     stdout.destroy();
   };
 
   return { audioIn, isShuttingDown: supervision.isShuttingDown, kill, process: ffmpeg, stdin, stdout };
+}
+
+/**
+ * Spawns dgrab with its stdout as a pipe for FFmpeg to take over. Its stderr carries a counters line every five minutes and at exit, logged at debug; a failure to
+ * start is logged as an error, and FFmpeg then sees its input end and exits through its own supervision.
+ * @param path - The dgrab binary.
+ * @param args - Its argv (buildDamageGrabArgs).
+ * @param streamId - Stream identifier for logging.
+ * @returns The child.
+ */
+function spawnDamageGrabber(path: string, args: string[], streamId?: string): ChildProcess {
+
+  const logPrefix = streamId ? "[" + streamId + "] " : "";
+  const grabber = spawn(path, args, { stdio: [ "ignore", "pipe", "pipe" ] });
+
+  grabber.stderr.on("data", (data: Buffer) => {
+
+    for(const line of data.toString().split("\n")) {
+
+      if(line.trim()) {
+
+        LOG.debug("streaming:ffmpeg", "%sdgrab: %s", logPrefix, line.trim().replace(/^dgrab: /, ""));
+      }
+    }
+  });
+
+  grabber.on("error", (error) => LOG.error("%sCould not start the change-driven grabber at %s: %s.", logPrefix, path, error.message));
+
+  return grabber;
 }
 
 /**

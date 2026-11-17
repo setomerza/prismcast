@@ -3,8 +3,8 @@
  * ffmpeg.encoder.test.ts: Tests for the FFmpeg encoder mode's pure pieces: the argv builders, the encoder check, and the search for an FFmpeg that can actually
  * encode. The search runs over a context literal, so no FFmpeg is spawned.
  */
-import { buildEncoderFFmpegArgs, buildEncoderProbeArgs, buildGrabSmoothingFilter, buildVideoEncoderArgs, isFFmpegVideoEncoder, isGrabSmoothed, probeEncoderFFmpegPath,
-  x11GrabInput } from "./ffmpeg.ts";
+import { buildDamageGrabArgs, buildEncoderFFmpegArgs, buildEncoderProbeArgs, buildGrabSmoothingFilter, buildVideoEncoderArgs, isDamageGrab, isFFmpegVideoEncoder,
+  isGrabSmoothed, probeEncoderFFmpegPath, x11GrabInput } from "./ffmpeg.ts";
 import { describe, test } from "node:test";
 import type { EncoderFFmpegOptions } from "./ffmpeg.ts";
 import assert from "node:assert/strict";
@@ -160,6 +160,44 @@ describe("buildEncoderFFmpegArgs with a grab region", () => {
 
     assert.equal(x11GrabInput({ display: ":99", x: 0, y: 0 }), ":99.0+0,0");
     assert.equal(x11GrabInput({ display: ":1.2", x: 5, y: 7 }), ":1.2+5,7");
+  });
+});
+
+describe("buildEncoderFFmpegArgs with a change-driven grab", () => {
+
+  const grab = { display: ":99", x: 1296, y: 89 };
+
+  test("reads dgrab's bgr0 from stdin at the NTSC rate, with no x11grab, no filter, and stdin left open", () => {
+
+    for(const frameRate of [ 30, 60 ]) {
+
+      const args = buildEncoderFFmpegArgs({ ...OPTIONS, damageGrab: "/usr/local/bin/dgrab", frameRate, grab });
+
+      assert.equal(valueOf(args, "-f"), "rawvideo");
+      assert.equal(valueOf(args, "-pix_fmt"), "bgr0", "NVENC converts RGB on the GPU");
+      assert.equal(valueOf(args, "-framerate"), String(frameRate * 1000) + "/1001");
+      assert.equal(valueOf(args, "-video_size"), "1280x720");
+      assert.ok(args.indexOf("pipe:0") < args.indexOf("pipe:3"), "video on stdin first, audio on fd 3 second");
+      assert.ok(!args.includes("x11grab"));
+      assert.ok(!args.includes("-vf"), "dgrab already de-duplicates and paces");
+      assert.ok(!args.includes("-nostdin"), "stdin is the video input");
+      assert.equal(valueOf(args, "-c:v"), "h264_nvenc");
+    }
+  });
+
+  test("names the region and the NTSC rate for dgrab", () => {
+
+    assert.deepEqual(buildDamageGrabArgs({ ...OPTIONS, grab }), [ ":99", "1296", "89", "1280", "720", "30000", "1001" ]);
+    assert.deepEqual(buildDamageGrabArgs({ ...OPTIONS, frameRate: 60, grab }).slice(-2), [ "60000", "1001" ]);
+  });
+
+  test("applies only with both a grab and a grabber, and replaces the smoothed grab", () => {
+
+    assert.equal(isDamageGrab({ damageGrab: "/usr/local/bin/dgrab", grab }), true);
+    assert.equal(isDamageGrab({ damageGrab: "/usr/local/bin/dgrab" }), false);
+    assert.equal(isDamageGrab({ grab }), false);
+    assert.equal(isGrabSmoothed({ ...OPTIONS, damageGrab: "/usr/local/bin/dgrab", grab }), false);
+    assert.equal(valueOf(buildEncoderFFmpegArgs({ ...OPTIONS, damageGrab: "/usr/local/bin/dgrab" }), "-pix_fmt"), "yuv420p", "no grab: the pump's raw frames");
   });
 });
 

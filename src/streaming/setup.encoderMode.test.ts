@@ -205,7 +205,8 @@ describe("createPageWithCapture: the FFmpeg encoder mode", () => {
     assert.deepEqual(encoderSpawns, [{
 
       bin: ENCODER_BINARY,
-      options: { audioBitrate: 128000, comment: undefined, encoder: "h264_nvenc", frameRate: 30, grab: { display: process.env["DISPLAY"] ?? ":99", x: 1297, y: 90 },
+      options: { audioBitrate: 128000, comment: undefined, damageGrab: undefined, encoder: "h264_nvenc", frameRate: 30,
+        grab: { display: process.env["DISPLAY"] ?? ":99", x: 1297, y: 90 },
         height: 720, keyframeInterval: 60, smoothGrab: true, videoBitrate: 6000000, width: 1280 }
     }], "the encoder grabs the window's content rectangle at the stream's rates, with a keyframe per segment");
 

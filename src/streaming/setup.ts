@@ -904,6 +904,7 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
 
             audioBitrate: settings.audioBitsPerSecond,
             comment,
+            damageGrab: process.env["FFMPEG_DAMAGE_GRAB"],
             encoder: plan.encoder,
             frameRate: settings.frameRate,
             grab: { display: process.env["DISPLAY"] ?? ":99", x: rect.x, y: rect.y },
