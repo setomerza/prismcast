@@ -669,7 +669,7 @@ export function buildVideoEncoderArgs(encoder: FFmpegVideoEncoder, videoBitrate:
  */
 export function isGrabSmoothed(options: Pick<EncoderFFmpegOptions, "frameRate" | "grab" | "smoothGrab">): boolean {
 
-  return !!options.grab && (options.smoothGrab !== false) && (options.frameRate <= 30);
+  return !!options.grab && (options.smoothGrab !== false) && (options.frameRate <= 60);
 }
 
 /**
@@ -693,11 +693,13 @@ export function buildGrabSmoothingFilter(frameRate: number): string {
 
   const duration = "1001/" + String(frameRate * 1000) + "/TB";
   const error = "(PTS-PREV_OUTPTS-" + duration + ")";
+  // A frame further than 1.2 output frames from its smoothed place is a real gap or jump, and keeps its own stamp.
+  const jump = String(Math.round(1200 / frameRate) / 1000);
 
   return [ "format=yuv420p",
     // Grabs of an unchanged screen are bit-identical; any block that differs keeps the frame.
     "mpdecimate=hi=128:lo=64:frac=0",
-    "setpts='if(isnan(PREV_OUTPTS),PTS,if(gt(abs" + error + ",0.04/TB),PTS,PREV_OUTPTS+" + duration + "+0.1*" + error + "))'",
+    "setpts='if(isnan(PREV_OUTPTS),PTS,if(gt(abs" + error + "," + jump + "/TB),PTS,PREV_OUTPTS+" + duration + "+0.1*" + error + "))'",
     "fps=" + String(frameRate * 1000) + "/1001" ].join(",");
 }
 

@@ -9,6 +9,7 @@ import type { Nullable, ResolvedChannel, ResolvedSiteProfile } from "../types/in
 import type { Request, Response } from "express";
 import type { ResumeData, ResumePosition } from "./hlsResume.ts";
 import { StreamSetupError, createPageWithCapture, generateStreamId, reestablishChannelManifest, setupStream, validateStreamUrl } from "./setup.ts";
+import { applyHighFrameRate, getHighFrameRatePolicy } from "./highFrameRate.ts";
 import { applyNativeQualityRefresh, cancelPrerollTimer, createHLSState, getAllStreams, getNextStreamId, getStream, getStreamCount, isCaptureIdentity,
   makePendingCaptureIdentity, registerStream, updateLastAccess } from "./registry.ts";
 import { buildProbeCacheStamp, clearProbeCache } from "../native/probe.ts";
@@ -1248,6 +1249,9 @@ function createPendingEntry(options: CreatePendingEntryOptions): StreamRegistryE
   // The registration instant, read once so the one instant stamps both the access time and the entry's start.
   const now = systemClock.now();
 
+  // A channel on the high frame rate list runs faster when no other stream does (highFrameRate.ts).
+  const settings = applyHighFrameRate(snapshotStreamSettings(CONFIG), channelName, getAllStreams().map((other) => other.settings), getHighFrameRatePolicy());
+
   const entry: StreamRegistryEntry = {
 
     channelName: channel?.name ?? null,
@@ -1266,7 +1270,7 @@ function createPendingEntry(options: CreatePendingEntryOptions): StreamRegistryE
     preTuned: options.preTuned ?? false,
     probeIdentity: null,
     profile: null,
-    settings: snapshotStreamSettings(CONFIG),
+    settings,
     startTime: now,
     streamIdStr,
     url

@@ -128,11 +128,11 @@ describe("buildEncoderFFmpegArgs with a grab region", () => {
     assert.equal(filter.split("'").length, 3, "the expression's commas are protected by one pair of quotes");
   });
 
-  test("grabs at the frame rate with no filter when smoothing is off, above 30 fps, or without a grab", () => {
+  test("grabs at the frame rate with no filter when smoothing is off, above 60 fps, or without a grab", () => {
 
     const grab = { display: ":99", x: 0, y: 0 };
 
-    for(const options of [ { ...OPTIONS, grab, smoothGrab: false }, { ...OPTIONS, frameRate: 60, grab } ]) {
+    for(const options of [ { ...OPTIONS, grab, smoothGrab: false }, { ...OPTIONS, frameRate: 120, grab } ]) {
 
       const args = buildEncoderFFmpegArgs(options);
 
@@ -142,6 +142,18 @@ describe("buildEncoderFFmpegArgs with a grab region", () => {
 
     assert.ok(!buildEncoderFFmpegArgs(OPTIONS).includes("-vf"), "raw frames from the pump are already paced");
     assert.equal(isGrabSmoothed(OPTIONS), false);
+  });
+
+  test("smooths a 60 fps grab: samples at 120, steps one 59.94 frame, and treats 20 ms off as a jump", () => {
+
+    const args = buildEncoderFFmpegArgs({ ...OPTIONS, frameRate: 60, grab: { display: ":99", x: 0, y: 0 } });
+    const filter = valueOf(args, "-vf") ?? "";
+
+    assert.equal(valueOf(args, "-framerate"), "120");
+    assert.ok(filter.endsWith("',fps=60000/1001"));
+    assert.ok(filter.includes("1001/60000/TB"));
+    assert.ok(filter.includes(",0.02/TB)"));
+    assert.ok(buildGrabSmoothingFilter(30).includes(",0.04/TB)"), "the 30 fps threshold is unchanged");
   });
 
   test("names the screen for a bare display and keeps one that already has it", () => {
