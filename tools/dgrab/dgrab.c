@@ -11,8 +11,9 @@
  * How: DAMAGE on the root window reports every drawing on the screen. When a report touches the region, dgrab waits for the burst of reports that make up one
  * presented frame to settle (SETTLE_US with no new report in the region, at most MAX_SETTLE_US), copies the region once with XShmGetImage, and queues it. A
  * clock ticking at RATE_NUM/RATE_DEN writes one frame per tick: the oldest queued new frame, or the previous one again when nothing new arrived. The queue holds
- * QUEUE frames; a fuller queue drops its oldest (a skip). Output starts one tick after the first grab, so a frame presented a little late still meets its tick.
- * A writer thread drains the output, so a reader that is slow for a moment never delays a grab. The region is grabbed at start and at least once a second even
+ * QUEUE frames; a fuller queue drops its oldest (a skip). The first grab is written at once and the clock starts when the reader has taken it, one tick later,
+ * so a frame presented a little late still meets its tick and nothing grabbed while the reader was starting sits ahead of it. A writer thread drains the output,
+ * so a reader that is slow for a moment never delays a grab; more than OUT_PENDING frames waiting for it are not queued, so a stall does not leave a delay. The region is grabbed at start and at least once a second even
  * with no reports, so a still screen still produces frames.
  *
  * Exits when stdout closes, after SECONDS when given, or on SIGTERM. Counters go to stderr every five minutes and at exit.
@@ -37,6 +38,9 @@
 
 #define QUEUE 3
 #define OUT 8
+
+// Frames waiting for the reader beyond this are not queued (counted as output full): a backlog would be a standing delay of the video against the audio.
+#define OUT_PENDING 2
 #define SETTLE_US 1500
 #define MAX_SETTLE_US 6000
 #define REFRESH_US 1000000
@@ -76,7 +80,7 @@ static int write_all(const uint8_t *p, size_t n) {
 
 // The output ring: a tick copies a frame in, the writer thread drains it to stdout. out_done is 1 at the end of input, 2 once stdout has closed.
 static uint8_t *out_ring[OUT];
-static int out_head = 0, out_len = 0, out_done = 0;
+static int out_head = 0, out_len = 0, out_done = 0, out_started = 0;
 static size_t out_bytes;
 static pthread_mutex_t out_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t out_cond = PTHREAD_COND_INITIALIZER;
@@ -119,6 +123,7 @@ static void *writer(void *arg) {
 
     out_head = (out_head + 1) % OUT;
     out_len--;
+    out_started = 1;
     pthread_mutex_unlock(&out_lock);
   }
 }
@@ -135,7 +140,7 @@ static int emit(const uint8_t *frame) {
     return -1;
   }
 
-  if(out_len == OUT) {
+  if(out_len >= OUT_PENDING) {
 
     pthread_mutex_unlock(&out_lock);
 
@@ -244,7 +249,7 @@ int main(int argc, char **argv) {
   pthread_create(&writer_thread, NULL, writer, NULL);
 
   long grabs = 0, reports = 0, written = 0, repeats = 0, drops = 0, out_full = 0;
-  int qhead = 0, qlen = 0, have_last = 0;
+  int qhead = 0, qlen = 0, have_last = 0, primed = 0;
   int64_t start = now_us(), pending_since = start, last_report = start, last_grab = start, next_tick = -1, tick0 = 0, tick_n = 0, next_stats = start + REPORT_US;
   int fd = ConnectionNumber(dpy);
 
@@ -287,10 +292,43 @@ int main(int argc, char **argv) {
       qlen++;
       pending_since = -1;
 
-      if(next_tick < 0) {
+      // The first grab goes straight out. The clock starts once the reader has taken it (below), so frames grabbed while FFmpeg was still starting up
+      // never sit in front of it as a standing delay.
+      if(!primed) {
 
-        tick0 = next_tick = last_grab + ((1000000 * den) / num);
+        memcpy(last, queue[qhead], frame_bytes);
+        qhead = (qhead + 1) % QUEUE;
+        qlen--;
+        have_last = primed = 1;
+
+        if(emit(last) < 0) {
+
+          break;
+        }
+
+        written++;
+      }
+    }
+
+    if(primed && (next_tick < 0)) {
+
+      pthread_mutex_lock(&out_lock);
+
+      int started = out_started;
+
+      pthread_mutex_unlock(&out_lock);
+
+      if(started) {
+
+        tick0 = next_tick = now_us() + ((1000000 * den) / num);
         tick_n = 0;
+
+        // Keep only the newest grab: anything older was drawn before the reader was there.
+        while(qlen > 1) {
+
+          qhead = (qhead + 1) % QUEUE;
+          qlen--;
+        }
       }
     }
 
@@ -351,6 +389,12 @@ int main(int argc, char **argv) {
     if((next_tick >= 0) && (next_tick < deadline)) {
 
       deadline = next_tick;
+    }
+
+    // Waiting for the reader to take the first frame: look again in a millisecond.
+    if(primed && (next_tick < 0) && ((now_us() + 1000) < deadline)) {
+
+      deadline = now_us() + 1000;
     }
 
     if(pending_since >= 0) {
