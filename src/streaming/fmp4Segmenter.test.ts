@@ -1080,6 +1080,35 @@ describe("createFMP4Segmenter", () => {
     }
   });
 
+  test("a keyframe fragment arriving just before the segment duration still closes the segment, one well before it does not", () => {
+
+    /* At 29.97 fps the encoder's 30-frame keyframe interval is 1001 ms, and fragment arrival jitters a few milliseconds either way. A fragment 2 ms early must
+     * cut, or the segment runs on to the next keyframe and the playlist alternates between one- and two-second segments. One at half the duration must not.
+     */
+    const clock = new TestClock(1700000000000);
+    const { segmentDuration } = makeStreamSettings({ segmentDuration: 1 });
+    const segmenter = createFMP4Segmenter({ clock, onError: mock.fn(), onStop: mock.fn(), segmentDuration, streamId });
+    const readable = new PassThrough();
+
+    segmenter.pipe(readable);
+    readable.write(makeFtyp());
+    readable.write(makeMoov());
+    readable.write(makeTestMoof());
+    readable.write(makeMdat("m0"));
+    readable.write(makeTestMoof());
+    assert.equal(segmenter.getSegmentIndex(), 1, "precondition: segment0 emitted via the fast path");
+
+    readable.write(makeMdat("m1"));
+    clock.advance(998);
+    readable.write(makeTestMoof());
+    assert.equal(segmenter.getSegmentIndex(), 2, "a fragment 2 ms early closes the segment");
+
+    readable.write(makeMdat("m2"));
+    clock.advance(500);
+    readable.write(makeTestMoof());
+    assert.equal(segmenter.getSegmentIndex(), 2, "a fragment half a duration in does not");
+  });
+
   test("a continuing segmenter lists earlier stored segments it holds no measured duration for at the duration it was constructed with", () => {
 
     /* A segmenter continuing at a starting index lists the stream's earlier segments, which live on the stream rather than the segmenter, and a segmenter with no

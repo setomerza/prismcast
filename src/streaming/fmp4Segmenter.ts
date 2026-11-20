@@ -33,6 +33,9 @@ import { systemClock } from "homebridge-plugin-utils";
 // Useful for diagnosing frozen screen issues in downstream HLS consumers.
 const KEYFRAME_DEBUG = false;
 
+// The share of the segment duration a fragment may arrive early and still close the segment (see the cut in the moof handler).
+const SEGMENT_CUT_TOLERANCE = 0.1;
+
 // Types.
 
 /* The playlist facts a stream's segmenters recorded about the segments they produced, handed to the segmenter that continues the stream's sequence so its
@@ -1108,7 +1111,10 @@ export function createFMP4Segmenter(options: FMP4SegmenterOptions): FMP4Segmente
           const elapsedMs = clock.now() - state.segmentStartTime;
           const targetMs = segmentDuration * 1000;
 
-          if(elapsedMs >= targetMs) {
+          // A keyframe fragment arriving a few milliseconds before the target still closes the segment. The encoder places keyframes one segment duration
+          // apart in media time (30 frames at 29.97 fps is 1001 ms), and their wall-clock arrival jitters around it; an exact threshold let about half of them
+          // fall short, so the segment ran to the next keyframe and the playlist alternated between one and two target durations.
+          if(elapsedMs >= targetMs * (1 - SEGMENT_CUT_TOLERANCE)) {
 
             outputSegment();
           }
