@@ -9,7 +9,8 @@
  * CPU - about 0.4 of a core per 30 fps stream. dgrab grabs each frame once, right after Chrome draws it, and hands NVENC the RGB, which it converts on the GPU.
  *
  * How: DAMAGE on the root window reports every drawing on the screen. When a report touches the region, dgrab waits for the burst of reports that make up one
- * presented frame to settle (SETTLE_US with no new report in the region, at most MAX_SETTLE_US), copies the region once with XShmGetImage, and queues it. A
+ * presented frame to settle (SETTLE_US with no new report in the region, at most MAX_SETTLE_US), copies the region once with XShmGetImage, and queues it
+ * unless its pixels equal the newest grab's (a redraw that changed nothing is not a frame). A
  * clock ticking at RATE_NUM/RATE_DEN writes one frame per tick: the oldest queued new frame, or the previous one again when nothing new arrived. The queue holds
  * QUEUE frames; a fuller queue drops its oldest (a skip). The first grab is written at once and the clock starts when the reader has taken it, one tick later,
  * so a frame presented a little late still meets its tick and nothing grabbed while the reader was starting sits ahead of it. A writer thread drains the output,
@@ -248,7 +249,7 @@ int main(int argc, char **argv) {
 
   pthread_create(&writer_thread, NULL, writer, NULL);
 
-  long grabs = 0, reports = 0, written = 0, repeats = 0, drops = 0, out_full = 0;
+  long grabs = 0, unchanged = 0, reports = 0, written = 0, repeats = 0, drops = 0, out_full = 0;
   int qhead = 0, qlen = 0, have_last = 0, primed = 0;
   int64_t start = now_us(), pending_since = start, last_report = start, last_grab = start, next_tick = -1, tick0 = 0, tick_n = 0, next_stats = start + REPORT_US;
   int fd = ConnectionNumber(dpy);
@@ -274,6 +275,28 @@ int main(int argc, char **argv) {
       XShmGetImage(dpy, root, img, rx, ry, AllPlanes);
       grabs++;
       last_grab = now_us();
+      pending_since = -1;
+
+      // A drawing that left the region's pixels as they were is not a new frame. Pages redraw small elements over the video (Prime Video repaints a spinner
+      // about 15 times a second); queued, those copies crowded real frames out of the queue. The newest grab is the queue's last entry, or the last frame
+      // written when the queue is empty. A real frame differs within the first rows, so the comparison is short except for the copies it catches.
+      if(have_last) {
+
+        const uint8_t *newest = qlen ? queue[(qhead + qlen - 1) % QUEUE] : last;
+        int same = 1;
+
+        for(int y = 0; same && (y < rh); y++) {
+
+          same = !memcmp(newest + ((size_t)y * row_bytes), img->data + ((size_t)y * (size_t)img->bytes_per_line), row_bytes);
+        }
+
+        if(same) {
+
+          unchanged++;
+
+          continue;
+        }
+      }
 
       if(qlen == QUEUE) {
 
@@ -290,7 +313,6 @@ int main(int argc, char **argv) {
       }
 
       qlen++;
-      pending_since = -1;
 
       // The first grab goes straight out. The clock starts once the reader has taken it (below), so frames grabbed while FFmpeg was still starting up
       // never sit in front of it as a standing delay.
@@ -379,7 +401,8 @@ int main(int argc, char **argv) {
 
     if(t >= next_stats) {
 
-      fprintf(stderr, "dgrab: %ld grabs, %ld reports, %ld written, %ld repeats, %ld drops, %ld output full\n", grabs, reports, written, repeats, drops, out_full);
+      fprintf(stderr, "dgrab: %ld grabs (%ld unchanged), %ld reports, %ld written, %ld repeats, %ld drops, %ld output full\n", grabs, unchanged, reports, written,
+        repeats, drops, out_full);
       next_stats = t + REPORT_US;
     }
 
@@ -463,7 +486,8 @@ int main(int argc, char **argv) {
     pthread_join(writer_thread, NULL);
   }
 
-  fprintf(stderr, "dgrab: %ld grabs, %ld reports, %ld written, %ld repeats, %ld drops, %ld output full\n", grabs, reports, written, repeats, drops, out_full);
+  fprintf(stderr, "dgrab: %ld grabs (%ld unchanged), %ld reports, %ld written, %ld repeats, %ld drops, %ld output full\n", grabs, unchanged, reports, written,
+    repeats, drops, out_full);
   XDamageDestroy(dpy, damage);
   XCloseDisplay(dpy);
 
