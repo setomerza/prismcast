@@ -14,7 +14,9 @@
  * clock ticking at RATE_NUM/RATE_DEN writes one frame per tick: the oldest queued new frame, or the previous one again when nothing new arrived. The queue holds
  * QUEUE frames; a fuller queue drops its oldest (a skip). The first grab is written at once and the clock starts when the reader has taken it, one tick later,
  * so a frame presented a little late still meets its tick and nothing grabbed while the reader was starting sits ahead of it. A writer thread drains the output,
- * so a reader that is slow for a moment never delays a grab; more than OUT_PENDING frames waiting for it are not queued, so a stall does not leave a delay. The region is grabbed at start and at least once a second even
+ * so a reader that is slow for a moment never delays a grab. Every tick becomes a frame: the encoder numbers frames rather than reading their time, and its
+ * audio follows the wall clock, so a tick left out would put the sound behind the picture for good. A tick that finds OUT_PENDING frames waiting is owed
+ * as one more copy of the newest of them, and so are the ticks missed while this process was held up. The region is grabbed at start and at least once a second even
  * with no reports, so a still screen still produces frames.
  *
  * Exits when stdout closes, after SECONDS when given, or on SIGTERM. Counters go to stderr every five minutes and at exit.
@@ -40,7 +42,7 @@
 #define QUEUE 3
 #define OUT 8
 
-// Frames waiting for the reader beyond this are not queued (counted as output full): a backlog would be a standing delay of the video against the audio.
+// Frames waiting for the reader beyond this are not queued: their ticks are owed as copies of the newest one waiting (counted as output full).
 #define OUT_PENDING 2
 #define SETTLE_US 1500
 #define MAX_SETTLE_US 6000
@@ -83,6 +85,7 @@ static int write_all(const uint8_t *p, size_t n) {
 static uint8_t *out_ring[OUT];
 static int out_head = 0, out_len = 0, out_done = 0, out_started = 0;
 static size_t out_bytes;
+static int64_t out_copies[OUT];
 static pthread_mutex_t out_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t out_cond = PTHREAD_COND_INITIALIZER;
 
@@ -122,15 +125,26 @@ static void *writer(void *arg) {
       return NULL;
     }
 
-    out_head = (out_head + 1) % OUT;
-    out_len--;
     out_started = 1;
+
+    // The same frame again for each tick owed on it, unless the input is over.
+    if((out_copies[out_head] > 0) && !out_done) {
+
+      out_copies[out_head]--;
+    } else {
+
+      out_copies[out_head] = 0;
+      out_head = (out_head + 1) % OUT;
+      out_len--;
+    }
+
     pthread_mutex_unlock(&out_lock);
   }
 }
 
-// Queues a frame for the writer. Answers -1 once stdout has closed, 1 when the ring was full and the frame was not queued, 0 otherwise.
-static int emit(const uint8_t *frame) {
+// Queues a frame for the writer, standing for the given number of ticks. Answers -1 once stdout has closed, 1 when the ring was full and the ticks were owed
+// on the newest frame waiting instead, 0 otherwise.
+static int emit(const uint8_t *frame, int64_t ticks) {
 
   pthread_mutex_lock(&out_lock);
 
@@ -143,6 +157,7 @@ static int emit(const uint8_t *frame) {
 
   if(out_len >= OUT_PENDING) {
 
+    out_copies[(out_head + out_len - 1) % OUT] += ticks;
     pthread_mutex_unlock(&out_lock);
 
     return 1;
@@ -153,6 +168,7 @@ static int emit(const uint8_t *frame) {
   pthread_mutex_unlock(&out_lock);
   memcpy(out_ring[slot], frame, out_bytes);
   pthread_mutex_lock(&out_lock);
+  out_copies[slot] = ticks - 1;
   out_len++;
   pthread_cond_signal(&out_cond);
   pthread_mutex_unlock(&out_lock);
@@ -323,7 +339,7 @@ int main(int argc, char **argv) {
         qlen--;
         have_last = primed = 1;
 
-        if(emit(last) < 0) {
+        if(emit(last, 1) < 0) {
 
           break;
         }
@@ -370,9 +386,17 @@ int main(int argc, char **argv) {
         repeats++;
       }
 
+      // This tick, and any missed while held up for over a tenth of a second: those become copies rather than a burst of loop turns.
+      int64_t ticks = 1;
+
+      if((t - next_tick) > 100000) {
+
+        ticks += ((t - next_tick) * num) / (1000000 * den);
+      }
+
       if(have_last) {
 
-        int result = emit(last);
+        int result = emit(last, ticks);
 
         if(result < 0) {
 
@@ -388,15 +412,8 @@ int main(int argc, char **argv) {
         }
       }
 
-      tick_n++;
+      tick_n += ticks;
       next_tick = tick0 + ((tick_n * 1000000 * den) / num);
-
-      // Far behind (the process was stopped, or the machine stalled): restart the clock rather than catch up in a burst.
-      if((now_us() - next_tick) > 100000) {
-
-        tick0 = next_tick = now_us();
-        tick_n = 0;
-      }
     }
 
     if(t >= next_stats) {
