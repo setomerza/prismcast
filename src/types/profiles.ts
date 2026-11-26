@@ -223,6 +223,10 @@ export interface SiteProfile {
   // playing main content rather than preloaded ad content.
   selectReadyVideo?: boolean;
 
+  // Whether a live event's player is walked up to the live edge after each tune (liveEdge.ts), for sites that resume a live event at the account's bookmark
+  // (Netflix). The walk presses the right arrow, which seeks 10 seconds on these players.
+  seekToLive?: boolean;
+
   // Whether this is a static page captured as visual content rather than a video player. When true, the stream handler navigates to the page directly and skips
   // video element detection, playback initialization, and health monitoring. Used for weather displays, information dashboards, and similar non-player pages.
   staticCapture?: boolean;
@@ -279,6 +283,9 @@ export interface ResolvedSiteProfile {
 
   // Whether to select video by readyState rather than DOM position.
   selectReadyVideo: boolean;
+
+  // Whether to walk the player up to the live edge after each tune.
+  seekToLive: boolean;
 
   // Whether this is a static page captured as visual content rather than a video player.
   staticCapture: boolean;

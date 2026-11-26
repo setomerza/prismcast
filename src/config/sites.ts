@@ -236,6 +236,17 @@ export const SITE_PROFILES: Record<string, SiteProfile> = {
     summary: "Multi-video sites ('f' key player)"
   },
 
+  // keyboardMultiVideo for live events that a site resumes at the account's bookmark (Netflix, 2026-11-25): after each tune the player is walked up to the live
+  // edge with its right-arrow seek (liveEdge.ts).
+  keyboardMultiVideoLive: {
+
+    category: "keyboard",
+    description: "Multi-video sites ('f' key player) whose live events resume at the bookmark; each tune seeks to the live edge with the right arrow.",
+    extends: "keyboardMultiVideo",
+    seekToLive: true,
+    summary: "Multi-video, seek to live"
+  },
+
   // Profile for non-video pages captured as static visual content. Examples include weather displays (weatherscan.net), maps (windy.com), and diagnostic pages.
   // The staticCapture flag tells the streaming code to navigate directly and skip video element detection, playback initialization, and health monitoring.
   staticPage: {
@@ -455,6 +466,9 @@ export const DEFAULT_SITE_PROFILE: ResolvedSiteProfile = {
 
   // No continuous playback limit - most sites allow indefinite streaming.
   maxContinuousPlayback: null,
+
+  // Don't seek - a tune plays from wherever the site starts it.
+  seekToLive: false,
 
   // Don't search iframes - assume video is in main page DOM.
   needsIframeHandling: false,

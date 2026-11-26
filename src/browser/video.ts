@@ -15,6 +15,7 @@ import { classifyBlockedPage } from "./blockedPage.ts";
 import { markDomainAuthRequired } from "../config/health.ts";
 import { startOverlayHandling } from "./consent.ts";
 import { systemClock } from "homebridge-plugin-utils";
+import { walkToLiveEdge } from "./liveEdge.ts";
 import { withTabSelected } from "./tabSelection.ts";
 
 /* These functions manage the video element lifecycle for streaming capture. The key challenges we solve:
@@ -1884,6 +1885,12 @@ export async function initializePlayback(page: Page, profile: ResolvedSiteProfil
   await ensurePlayback(page, context, profile, { clock: deps.clock });
 
   LOG.debug("timing:tune", "Playback ensured. (+%sms)", elapsed());
+
+  // A live event the site resumed at the bookmark is walked up to the live edge in the background; the tune is complete without waiting for it.
+  if(profile.seekToLive) {
+
+    void walkToLiveEdge(page, context, buildVideoSelectorType(profile), deps.clock);
+  }
 
   return { context, directTune };
 }
